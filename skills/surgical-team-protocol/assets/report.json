@@ -1,0 +1,17 @@
+{
+  "status": "PARTIAL",
+  "summary": "Added 6 retry tests; 5 pass, 1 exposes a real bug: a 429 with Retry-After is retried immediately.",
+  "criteria": [
+    {"met": true, "evidence": "cargo test -p upload retry: 5 passed, 1 failed (retries_honor_retry_after)"},
+    {"met": true, "evidence": "Mutating backoff multiplier 2 -> 1 fails retries_back_off_exponentially"},
+    {"met": false, "evidence": "Not verified for the two legacy tests I did not touch"}
+  ],
+  "evidence": "$ cargo test -p upload retry\n...\ntest result: FAILED. 5 passed; 1 failed",
+  "risks": "The Retry-After test uses a fake clock; real clock skew is untested.",
+  "recommended": "Decide whether Retry-After is in scope for v1; if so, order the fix for the surgeon.",
+  "out_of_scope": [
+    {"finding": "legacy tests share a temp dir", "role": "tester", "order": "isolate legacy upload tests"}
+  ],
+  "blocker": "",
+  "cost": {"tokens": 42000}
+}

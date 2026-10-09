@@ -1,0 +1,26 @@
+{
+  "title": "Tests for upload retry",
+  "role": "tester",
+  "authority": "L1",
+  "push": false,
+  "intent": "Uploads fail silently under packet loss; we need the retry path pinned down before changing it.",
+  "scope": {
+    "in": ["Adversarial tests for UploadClient retry and backoff"],
+    "out": ["Changing UploadClient", "Unrelated flaky tests"]
+  },
+  "inputs": {
+    "files": ["SPEC.md#uploads", "tests/upload/"],
+    "decisions": [],
+    "orders": []
+  },
+  "acceptance": [
+    {"text": "New retry tests pass against the current client", "check": "cargo test -p upload retry"},
+    {"text": "At least one deliberate mutation of the backoff is caught", "check": "test -s .mutations.txt"},
+    {"text": "Every test name states the claim it makes"}
+  ],
+  "budget": {"minutes": 30},
+  "paths": ["tests/upload"],
+  "depends_on": [],
+  "blind": ["src/upload"],
+  "base": "main"
+}

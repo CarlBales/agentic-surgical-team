@@ -4,7 +4,8 @@ A proof-of-concept agent team modeled on Harlan Mills' *chief programmer team*,
 as described by Frederick P. Brooks Jr. in "The Surgical Team" (chapter 3 of
 *The Mythical Man-Month*, 1975).
 
-The surgeon is a human. Everyone else on the team is an agent.
+The surgeon is a human. Everyone else on the team is an agent, and a small
+deterministic control plane (`st`) keeps the books and enforces the rules.
 
 ## The idea
 
@@ -27,159 +28,149 @@ long ago absorbed by better tools or by programmers themselves. The structure
 still holds, though, and it describes AI augmentation well: the human keeps
 authority and conceptual integrity, and agents provide "all conceivable
 support." Brooks summed it up as *few minds, many hands*. Agents give you the
-hands without diluting the mind.
+hands without diluting the mind, provided the hands are tools and not more
+minds to coordinate.
 
 ## Role mapping
 
-| Brooks (1975) | This system | Kind | Skill |
+| Brooks (1975) | This system | Kind | Definition |
 |---|---|---|---|
 | Surgeon (chief programmer) | The user | Human | [SURGEON.md](SURGEON.md) |
-| Copilot | Design partner, critic, context keeper, primary session agent | Agent | [copilot](skills/copilot/SKILL.md) |
-| Administrator (+ secretary) | Dispatcher, budgets, workspaces, status, outward correspondence | Agent | [administrator](skills/administrator/SKILL.md) |
-| Editor (+ secretary) | Turns surgeon drafts into finished docs; handles publishing mechanics | Agent | [editor](skills/editor/SKILL.md) |
-| Program clerk | Keeper of the ledger: orders, reports, decisions, status | Agent | [program-clerk](skills/program-clerk/SKILL.md) |
-| Toolsmith | Dev environment, scripts, CI, MCP servers, tools for the other agents | Agent | [toolsmith](skills/toolsmith/SKILL.md) |
-| Tester | Adversary from the spec, plus scaffolding and test data for daily work | Agent | [tester](skills/tester/SKILL.md) |
-| Language lawyer | Interchangeable language specialist (Rust first) | Agent | [language-lawyer-rust](skills/language-lawyer-rust/SKILL.md) |
+| Copilot | Design partner, critic, front channel, the only dispatcher | Agent `st-copilot` | [copilot](skills/copilot/SKILL.md) |
+| Administrator (+ secretary) | IDs, validation, workspaces, dispatch, status | Tool | [`st`](bin/st) |
+| Program clerk | The ledger: orders, reports, checks, decisions | Tool | [`st`](bin/st) |
+| Editor (+ secretary) | Turns surgeon drafts into finished docs | Agent `st-editor` | [editor](skills/editor/SKILL.md) |
+| Toolsmith | Dev environment, scripts, CI, tools for the team | Agent `st-toolsmith` | [toolsmith](skills/toolsmith/SKILL.md) |
+| Tester | Adversary from the spec, plus scaffolding and data | Agent `st-tester` | [tester](skills/tester/SKILL.md) |
+| Language lawyer | Interchangeable language specialist (Rust first) | Agent `st-language-lawyer-rust` | [language-lawyer-rust](skills/language-lawyer-rust/SKILL.md) |
 | *(new)* | Shared rules every agent follows | Protocol | [surgical-team-protocol](skills/surgical-team-protocol/SKILL.md) |
+| *(new)* | Authority enforcement on every tool call | Hook | `st guard` |
 
 ### What changed from 1975
 
-- **Secretaries are merged into their principals.** The administrator handles
-  correspondence (tickets, PR descriptions, status notes), and the editor
-  handles production mechanics.
-- **The copilot is the front channel.** Brooks' copilot "knows all the code
-  intimately," so it's the natural agent to hold session context. It's the
-  agent the surgeon talks to.
-- **The administrator dispatches.** Brooks' administrator managed money,
-  people, space, and machines. Here those become token and time budgets, agent
-  instances, worktrees and branches, and compute.
-- **The program clerk keeps its importance.** Mills considered the clerk
-  critical, on the grounds that recording the work is what moves programming
-  from private art toward public practice. Agents forget between sessions, so
-  the clerk's ledger serves as the team's long-term memory.
+- **The administrator and clerk became a tool.** Their duties (numbering,
+  validating, tracking state, creating workspaces, keeping status) are
+  functions. An LLM doing them is slow, nondeterministic, and can corrupt
+  the record. `st` does them atomically. Mills' point about the clerk
+  survives intact: recording the work is what makes it public practice. It
+  just doesn't need a mind.
+- **The copilot is the front channel and the dispatcher.** It holds the
+  session with the surgeon and is the only agent that starts other agents.
+  (Kiro subagents cannot spawn subagents, so a separate dispatcher could not
+  work anyway.) Correspondence, the secretaries' old job, is the copilot's.
 - **Agents may write code; only the surgeon accepts it.** Brooks let the
-  copilot write code without being responsible for any of it. That principle
-  now covers every agent. Agents produce drafts on branches or in worktrees,
-  and nothing reaches the mainline until the surgeon accepts it.
-- **The language lawyer is a slot, not a person.** Brooks noted that one
-  language lawyer can serve two or three surgeons. Here, any
-  `language-lawyer-<lang>` skill that satisfies the
-  [language lawyer contract](skills/surgical-team-protocol/references/language-lawyer-contract.md)
-  can fill the slot. Rust is the first one.
+  copilot write code without being responsible for any of it. That now
+  covers every agent, and it is enforced: agents work in worktrees outside
+  the repository, a guard hook confines them to their order's authority,
+  and approvals and verdicts carry the surgeon's signature.
+- **The language lawyer is a slot, not a person.** Any
+  `language-lawyer-<lang>` skill satisfying the
+  [contract](skills/surgical-team-protocol/references/language-lawyer-contract.md)
+  fills it.
 
 ## Architecture
 
 ```
-                         ┌──────────────┐
-                         │   SURGEON    │  human: decides, designs, accepts
-                         └──────┬───────┘
-                                │ conversation
-                         ┌──────▼───────┐
-                         │   COPILOT    │  primary session agent; drafts work orders
-                         └──────┬───────┘
-                                │ approved work orders
-                         ┌──────▼───────┐
-                         │ADMINISTRATOR │  dispatch, budgets, worktrees, status
-                         └──────┬───────┘
-          ┌──────────┬──────────┼──────────┬──────────────┐
-     ┌────▼───┐ ┌────▼────┐ ┌───▼───┐ ┌────▼─────┐ ┌──────▼───────┐
-     │ TESTER │ │TOOLSMITH│ │EDITOR │ │ LANGUAGE │ │ (future      │
-     │        │ │         │ │       │ │ LAWYER   │ │  specialists)│
-     └────┬───┘ └────┬────┘ └───┬───┘ └────┬─────┘ └──────────────┘
-          └──────────┴──── reports ────────┘
-                                │
-                         ┌──────▼───────┐
-                         │PROGRAM CLERK │  ledger: .surgical-team/
-                         └──────────────┘
+            ┌──────────────┐  st approve / accept / decide / grant   (signed)
+            │   SURGEON    │──────────────────────────────────────────────┐
+            └──────┬───────┘                                              │
+                   │ conversation                                         ▼
+            ┌──────▼───────┐   st draft / dispatch / check      ┌──────────────────┐
+            │  st-copilot  │───────────────────────────────────▶│ st (control      │
+            └──────┬───────┘                                    │ plane) + ledger  │
+                   │ subagent stages, one per dispatched order  │ .surgical-team/  │
+   ┌───────────┬───┴───────┬──────────────┐                     └────────▲─────────┘
+┌──▼───────┐┌──▼────────┐┌─▼────────┐┌────▼───────────────┐              │
+│st-tester ││st-toolsmith││st-editor ││st-language-lawyer-*│── st report ─┘
+└──────────┘└───────────┘└──────────┘└────────────────────┘
+        every tool call of every agent ──▶ st guard (preToolUse) ──▶ allow / block
 ```
 
-Every interaction between agents is a **work order** with a matching
-**report** (see the [protocol](skills/surgical-team-protocol/SKILL.md)). The
-clerk files every order, report, and surgeon decision under `.surgical-team/`
-in the target project. That gives a cold-started agent, or a human
-teammate, enough to reconstruct the state of the work.
+A work order is the only way work enters the team, and each dispatch gets
+exactly one report. `st check` re-runs the order's executable acceptance
+criteria in the workspace, so the surgeon judges the work against an
+independent record, not only against the agent's own account.
 
 ## Repository layout
 
 ```
 the-surgical-team/
-├── README.md                     # this file
-├── SURGEON.md                    # charter for the human in the chair
-├── scripts/validate-skills.sh    # validates all skills against the Agent Skills spec
+├── README.md, SURGEON.md
+├── bin/st                       # control plane, guard, and agent-config installer (Python stdlib)
+├── tests/test_st.py             # unit tests: ledger, signing, checks, guard
+├── tests/scenarios.py           # behavioral scenarios: real agents, assertions on state
+├── docs/findings.md             # the v0.1 review and how each finding was resolved
+├── scripts/validate-skills.sh   # Agent Skills structural validation
 └── skills/
-    ├── surgical-team-protocol/   # shared rules: authority, work orders, reports, ledger
-    │   ├── references/           # authority levels, ledger layout, language-lawyer contract
-    │   └── assets/               # work-order, report, decision, language-lawyer templates
+    ├── surgical-team-protocol/  # shared rules; references/ and JSON templates in assets/
     ├── copilot/
-    ├── administrator/
     ├── editor/
-    ├── program-clerk/
     ├── toolsmith/
     ├── tester/
     └── language-lawyer-rust/
-        └── references/           # ownership and soundness, API design, toolchain, pitfalls
 ```
-
-Each directory under `skills/` is a standalone [Agent Skill](https://agentskills.io/specification):
-a `SKILL.md` with YAML frontmatter, plus optional `references/` and `assets/`
-loaded through progressive disclosure.
 
 ## Using it (Kiro CLI)
 
-Kiro discovers skills through `skill://` resources. To try the team in a
-project, either symlink the skills into the project's `.kiro/skills/`
-directory:
+Requires Python 3.10+, git, and OpenSSH 8.1+ (for `ssh-keygen -Y`).
 
 ```bash
-mkdir -p .kiro/skills
-for s in /Users/cbales/Sandbox/the-surgical-team/skills/*/; do
-  ln -s "$s" ".kiro/skills/$(basename "$s")"
-done
+export PATH="$PWD/bin:$PATH"
+st setup --key ~/.ssh/id_ed25519 --identity you@example.com   # key must need a passphrase, touch, or confirm
+st install                                                    # ~/.kiro/agents/st-{copilot,editor,toolsmith,tester,language-lawyer-rust}.json
+
+cd ~/code/your-project
+st init --default-standing
+kiro-cli chat --agent st-copilot
 ```
 
-or reference them from a custom agent config:
+Each `st-<role>` agent loads only the protocol and its own role skill, and
+runs every tool call through `st guard --role <role>`. Don't load these
+skills into a general-purpose agent: they assume the guard and the ledger
+exist.
 
-```json
-{
-  "name": "operating-room",
-  "description": "Copilot for a human surgeon; dispatches the surgical team",
-  "resources": [
-    "skill:///Users/cbales/Sandbox/the-surgical-team/skills/*/SKILL.md"
-  ]
-}
-```
+The full working flow is in [SURGEON.md](SURGEON.md).
 
-Then start a session and tell the copilot to scrub in. The intended flow is
-described in [SURGEON.md](SURGEON.md).
-
-## Validation
+## Verification
 
 ```bash
-scripts/validate-skills.sh
+python3 -m unittest discover -s tests   # control plane and guard (no model calls)
+scripts/validate-skills.sh              # skills against the Agent Skills spec
+python3 tests/scenarios.py              # live agents via kiro-cli; spends tokens, takes minutes
 ```
 
-This script runs the reference validator (`skills-ref`) on every skill.
+The scenarios assert on what happened (ledger state, the filesystem), never
+on what the model said: a tester told to edit the main checkout leaves it
+clean, a tester with no spec reports `BLOCKED`, a blind tester finds the
+spec violation it cannot see in the code, and the copilot cannot approve
+its own order.
 
-## Status and open questions
+## Limits and open questions
 
-This is a v0.1 specification set. It has no runtime of its own yet; it relies
-on the host agent (Kiro, or any client that supports skills and sub-agents) to
-spawn roles. Questions for future iterations:
-
-- Should each role become its own agent config (tool permissions per role),
-  or remain skills loaded into generic sub-agents?
-- Should the copilot have standing authority to dispatch low-risk orders
-  (L0/L1) without asking the surgeon each time? The protocol supports
-  standing orders, but no role ships with one; the surgeon grants them
-  per project. (The program clerk's ledger-write exception is part of the
-  protocol itself, not a standing order.)
-- How should the system scale to multiple surgeons? Brooks' answer was a
-  system architect above the surgeons, and shared language lawyers and
-  administrators.
-- What other specialists belong on the team? Candidates: security reviewer,
-  performance analyst, UX reviewer, and other language lawyers (TypeScript,
-  Python, Go).
+- **Authority lives outside the repository.** The guard trusts only
+  signatures and a local lease store, never the ledger's state, so a forged
+  or rolled-back ledger, or one pulled from another clone, grants nothing.
+  Approvals expire, and each one backs at most one reported attempt.
+- **The guard is a parser, not a sandbox.** It confines where agents write
+  and what they run outside a workspace, but a build script run inside a
+  workspace can do anything the user can. For hostile code, run the team in
+  a container with the main checkout read-only. See
+  [authority levels](skills/surgical-team-protocol/references/authority-levels.md).
+- **Budgets are estimates.** Nothing in the team can interrupt a running
+  subagent; hard limits come from the host. `st` records actual wall clock
+  and flags overruns and stale dispatches.
+- **Kiro only, for now.** The guard speaks Kiro's preToolUse hook format.
+  Other hosts with pre-tool hooks need an adapter.
+- **The scenario suite is small.** Five scenarios cover the authority
+  boundaries and two role behaviors. They are pass/fail on single runs, and
+  model behavior varies: run them several times before trusting a change to
+  a prompt, and add a scenario whenever a role misbehaves.
+- **Checks run trusted commands.** `st check` executes the order's `check`
+  strings. The guard only lets an agent trigger them when the surgeon signed
+  that exact spec; under a standing order, the surgeon runs `st check`.
+- **Multiple surgeons.** Brooks' answer was a system architect above the
+  surgeons. Here that would be multiple signers with scoped trust, not yet
+  designed.
 
 ## Sources
 

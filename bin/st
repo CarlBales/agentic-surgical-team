@@ -1,0 +1,1885 @@
+#!/usr/bin/env python3
+"""st — the surgical team's control plane.
+
+Deterministic duties that v0.1 gave to LLM roles (the program clerk and
+most of the administrator) live here instead: schema-validated records,
+atomic IDs, an explicit state machine, worktrees outside the repository,
+executable acceptance checks, and signed surgeon actions. `st guard` is a
+Kiro preToolUse hook that enforces authority levels from the same records.
+
+Standard library only. Requires git and ssh-keygen (OpenSSH >= 8.1).
+
+Agent-side commands:   draft revise dispatch brief report check reclaim
+                       journal status show list verify guard
+Surgeon-only commands: setup init approve accept reject defer cancel
+                       decide grant revoke
+Surgeon-only commands sign with the surgeon's key and are refused by the
+guard when an agent tries to run them.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+VERSION = "0.3.0"
+NAMESPACE = "surgical-team"
+LEDGER_DIRNAME = ".surgical-team"
+LEVELS = {"L0": 0, "L1": 1, "L2": 2}
+ROLE_RE = re.compile(r"^(copilot|editor|toolsmith|tester|language-lawyer-[a-z0-9]+)$")
+WO_RE = re.compile(r"^WO-\d{8}-\d{3}$")
+DEC_RE = re.compile(r"^DEC-\d{3,}$")
+REPORT_STATUSES = {"DONE", "PARTIAL", "BLOCKED", "DECLINED"}
+SURGEON_CMDS = {"setup", "init", "approve", "accept", "reject", "defer",
+                "cancel", "decide", "grant", "revoke", "install"}
+SPECIALIST_ST_CMDS = {"brief", "show", "list", "status", "report", "verify", "check"}
+AGENT_PREFIX = "st-"  # Kiro agent config names: st-copilot, st-tester, ...
+TERMINAL = {"accepted", "rejected", "cancelled"}
+TRANSITIONS = {
+    "drafted": {"approved", "dispatched", "drafted", "cancelled"},
+    "approved": {"dispatched", "drafted", "cancelled"},
+    "dispatched": {"reported", "approved", "drafted", "cancelled"},
+    "reported": {"accepted", "rejected", "deferred", "drafted", "cancelled"},
+    "deferred": {"accepted", "rejected", "drafted", "cancelled"},
+    "accepted": set(), "rejected": set(), "cancelled": set(),
+}
+DEFAULT_CHECK_TIMEOUT = 600
+STALE_FACTOR = 2  # dispatched with no report after budget x this is stale
+
+
+class StError(Exception):
+    pass
+
+
+# --- time, hashing -----------------------------------------------------------
+
+def now() -> dt.datetime:
+    override = os.environ.get("ST_NOW")
+    if override:
+        return parse_iso(override)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t: dt.datetime) -> str:
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s: str) -> dt.datetime:
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def canon(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode()
+
+
+def sha(obj) -> str:
+    return hashlib.sha256(canon(obj)).hexdigest()
+
+
+# --- git and paths -----------------------------------------------------------
+
+def git(args, cwd, check=True) -> str:
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode:
+        raise StError(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def repo_root(cwd) -> Path:
+    """Main worktree root, even when called from a linked worktree."""
+    common = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)
+    p = Path(common)
+    if p.name != ".git":
+        raise StError("bare repositories are not supported")
+    return p.parent.resolve()
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def slugify(s: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    return s[:40].rstrip("-") or "work"
+
+
+# --- config and signing ------------------------------------------------------
+
+def config_dir() -> Path:
+    # The override exists for tests. The guard runs in the surgeon's
+    # environment (the hook process), so an agent cannot redirect it.
+    return Path(os.environ.get("ST_CONFIG_DIR")
+                or Path.home() / ".config" / "surgical-team")
+
+
+def load_config() -> dict:
+    f = config_dir() / "config.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def sign(payload: dict) -> dict:
+    cfg = load_config()
+    key, ident = cfg.get("key"), cfg.get("identity")
+    if not key or not ident:
+        raise StError("no signing key configured; run: st setup --key PATH --identity NAME")
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "payload"
+        f.write_bytes(canon(payload))
+        r = subprocess.run(["ssh-keygen", "-Y", "sign", "-f", key, "-n", NAMESPACE,
+                            "-q", str(f)], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+        if r.returncode:
+            raise StError(f"signing failed: {r.stderr.strip()}")
+        sig = (Path(d) / "payload.sig").read_text()
+    return {"signer": ident, "payload": payload, "sig": sig}
+
+
+_verify_cache: dict = {}
+
+
+def verify(signed, expect: dict | None = None) -> tuple[bool, str]:
+    if not isinstance(signed, dict) or not {"signer", "payload", "sig"} <= signed.keys():
+        return False, "unsigned"
+    payload = signed["payload"]
+    if expect:
+        for k, v in expect.items():
+            if payload.get(k) != v:
+                return False, f"signed {k} does not match"
+    allowed = config_dir() / "allowed_signers"
+    if not allowed.exists():
+        return False, f"no allowed_signers at {allowed}"
+    key = (signed["signer"], signed["sig"], canon(payload))
+    if key in _verify_cache:
+        return _verify_cache[key]
+    with tempfile.TemporaryDirectory() as d:
+        s = Path(d) / "sig"
+        s.write_text(signed["sig"])
+        r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(allowed),
+                            "-I", str(signed["signer"]), "-n", NAMESPACE, "-s", str(s)],
+                           input=canon(payload), capture_output=True)
+    result = (True, "ok") if r.returncode == 0 else (False, "bad signature")
+    _verify_cache[key] = result
+    return result
+
+
+# --- ledger ------------------------------------------------------------------
+
+class Ledger:
+    SUBDIRS = ("orders", "reports", "checks", "verdicts", "decisions", "journal")
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.dir = root / LEDGER_DIRNAME
+
+    @classmethod
+    def at(cls, cwd=None) -> "Ledger":
+        return cls(repo_root(cwd or os.getcwd()))
+
+    def exists(self) -> bool:
+        return (self.dir / "orders").is_dir()
+
+    def require(self):
+        if not self.exists():
+            raise StError(f"no ledger at {self.dir}; the surgeon runs: st init")
+
+    @contextlib.contextmanager
+    def lock(self):
+        self.require()
+        with open(self.dir / ".lock", "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+    def workspace(self, wo: str) -> Path:
+        return self.root.parent / f"{self.root.name}.st" / wo
+
+    # files
+    def _read(self, p: Path):
+        return json.loads(p.read_text())
+
+    def _write(self, p: Path, obj):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        os.replace(tmp, p)
+
+    def event(self, name: str, **data):
+        with open(self.dir / "events.jsonl", "a") as fh:
+            fh.write(json.dumps({"at": iso(now()), "event": name, **data},
+                                sort_keys=True) + "\n")
+
+    # orders
+    def order_path(self, wo): return self.dir / "orders" / f"{wo}.json"
+
+    def order(self, wo: str) -> dict:
+        if not WO_RE.match(wo or ""):
+            raise StError(f"not an order ID: {wo!r}")
+        p = self.order_path(wo)
+        if not p.exists():
+            raise StError(f"no such order: {wo}")
+        return self._read(p)
+
+    def save_order(self, o): self._write(self.order_path(o["id"]), o)
+
+    def orders(self) -> list[dict]:
+        return [self._read(p) for p in sorted((self.dir / "orders").glob("WO-*.json"))]
+
+    def next_order_id(self) -> str:
+        day = now().strftime("%Y%m%d")
+        nums = [int(p.stem[-3:]) for p in (self.dir / "orders").glob(f"WO-{day}-*.json")]
+        n = max(nums, default=0) + 1
+        if n > 999:
+            raise StError("order numbering exhausted for today")
+        return f"WO-{day}-{n:03d}"
+
+    # per-attempt records
+    def attempt_path(self, kind, wo, attempt):
+        return self.dir / kind / f"{wo}.a{attempt}.json"
+
+    def attempt_record(self, kind, wo, attempt):
+        p = self.attempt_path(kind, wo, attempt)
+        return self._read(p) if p.exists() else None
+
+    # decisions
+    def decision(self, dec: str) -> dict | None:
+        p = self.dir / "decisions" / f"{dec}.json"
+        return self._read(p) if p.exists() else None
+
+    def decisions(self) -> list[dict]:
+        return [self._read(p) for p in sorted((self.dir / "decisions").glob("DEC-*.json"))]
+
+    def next_decision_id(self) -> str:
+        nums = [int(p.stem[4:]) for p in (self.dir / "decisions").glob("DEC-*.json")]
+        return f"DEC-{max(nums, default=0) + 1:03d}"
+
+
+class Leases:
+    """Where live authority is recorded: outside the repository.
+
+    The ledger is shared (committed, pulled, merged), so anything in it can
+    arrive from someone without the surgeon's key. Leases live in the
+    surgeon's config directory, which the guard protects from every agent
+    tool, and are append-only: `st dispatch` opens one, and `st report`,
+    `reclaim`, `cancel`, and verdicts close it. The guard grants authority
+    only for an open lease whose signed grant still verifies, so editing,
+    rolling back, or deleting ledger files grants nothing, and a ledger from
+    another clone is inert here.
+    """
+
+    def __init__(self, root: Path):
+        key = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
+        self.path = config_dir() / "leases" / f"{key}.jsonl"
+
+    def events(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text().splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                out.append(json.loads(line))
+        return out
+
+    def append(self, **ev):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        with open(self.path, "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.write(json.dumps({"at": iso(now()), **ev}, sort_keys=True) + "\n")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+    def open_leases(self) -> dict:
+        """order id -> the open lease record, if any."""
+        live = {}
+        for ev in self.events():
+            if ev.get("event") == "open":
+                live[ev["order"]] = ev
+            elif ev.get("event") == "close" and ev["order"] in live and \
+                    live[ev["order"]].get("attempt") == ev.get("attempt"):
+                del live[ev["order"]]
+        return live
+
+    def consumed(self, grant: str) -> bool:
+        """A grant backs at most one reported attempt."""
+        return any(ev.get("event") == "close" and ev.get("grant") == grant and
+                   ev.get("reason") in ("reported", "verdict", "cancelled")
+                   for ev in self.events())
+
+    def close(self, order: str, reason: str):
+        lease = self.open_leases().get(order)
+        if lease:
+            self.append(event="close", order=order, attempt=lease["attempt"],
+                        grant=lease["grant"], reason=reason)
+        return lease
+
+
+def grant_id(o: dict) -> str:
+    """Identity of what authorizes an order: the approval signature, or the
+    standing order plus the exact spec it covered."""
+    appr = o.get("approval")
+    if appr and appr.get("sig"):
+        return "approval:" + hashlib.sha256(appr["sig"].encode()).hexdigest()
+    return f"standing:{o['spec'].get('standing')}:{sha(o['spec'])}"
+
+
+def live_orders(L: Ledger) -> list[tuple[dict, dict, int, bool]]:
+    """Orders with authority right now: (order, lease, level, push).
+
+    Derived from the local lease store and signatures only. The ledger
+    supplies the spec, which must match what the lease and grant bound.
+    """
+    out = []
+    t = now()
+    for wo, lease in Leases(L.root).open_leases().items():
+        with contextlib.suppress(StError, OSError, json.JSONDecodeError, KeyError):
+            o = L.order(wo)
+            if sha(o["spec"]) != lease.get("spec_sha") or grant_id(o) != lease.get("grant"):
+                continue
+            if o["spec"]["role"] != lease.get("role"):
+                continue
+            if lease.get("not_after") and t > parse_iso(lease["not_after"]):
+                continue
+            level, push, _ = effective_authority(L, o)
+            if level is None:
+                continue
+            if verdict_for(L, o, lease["attempt"]) in ("accepted", "rejected"):
+                continue
+            out.append((o, lease, level, push))
+    return out
+
+
+def transition(L: Ledger, o: dict, to: str, note: str = "", by: str = "st"):
+    frm = o["state"]
+    if to not in TRANSITIONS[frm]:
+        raise StError(f"{o['id']}: cannot go from {frm} to {to}")
+    o["state"] = to
+    o.setdefault("history", []).append({"at": iso(now()), "from": frm, "to": to,
+                                        "by": by, "note": note})
+    L.event("transition", order=o["id"], frm=frm, to=to, by=by, note=note)
+
+
+# --- decision status ---------------------------------------------------------
+
+def decision_status(L: Ledger, dec_id: str) -> tuple[str, dict | None]:
+    """Return ('active'|'superseded'|'revoked'|'expired'|'unverified'|'missing', record)."""
+    rec = L.decision(dec_id)
+    if not rec:
+        return "missing", None
+    ok, _ = verify(rec.get("signed"), {"id": dec_id})
+    if not ok:
+        return "unverified", rec
+    for other in L.decisions():
+        ok2, _ = verify(other.get("signed"))
+        if not ok2:
+            continue
+        p = other["signed"]["payload"]
+        if p.get("kind") == "revoke" and p.get("target") == dec_id:
+            return "revoked", rec
+        if p.get("supersedes") == dec_id:
+            return "superseded", rec
+    exp = rec["signed"]["payload"].get("expires")
+    if exp and now().date() > dt.date.fromisoformat(exp):
+        return "expired", rec
+    return "active", rec
+
+
+# --- authority ---------------------------------------------------------------
+
+def effective_authority(L: Ledger, o: dict) -> tuple[int | None, bool, str]:
+    """(level, push_permitted, source-or-reason). level None means no authority."""
+    spec = o["spec"]
+    appr = o.get("approval")
+    if appr:
+        ok, why = verify(appr, {"kind": "approve", "order": o["id"], "spec_sha": sha(spec)})
+        if not ok:
+            return None, False, f"approval {why}"
+        p = appr["payload"]
+        if not p.get("not_after"):
+            return None, False, "approval has no expiry (pre-0.3); the surgeon re-approves"
+        if now() > parse_iso(p["not_after"]):
+            return None, False, f"approval expired at {p['not_after']}"
+        return LEVELS[p["authority"]], bool(p.get("push")), "approval"
+    dec_id = spec.get("standing")
+    if dec_id:
+        st, rec = decision_status(L, dec_id)
+        if st != "active":
+            return None, False, f"standing order {dec_id} is {st}"
+        p = rec["signed"]["payload"]
+        if p.get("kind") != "standing":
+            return None, False, f"{dec_id} is not a standing order"
+        if p["role"] not in ("*", spec["role"]):
+            return None, False, f"{dec_id} does not cover role {spec['role']}"
+        if LEVELS[spec["authority"]] > LEVELS[p["max_authority"]]:
+            return None, False, f"{dec_id} allows at most {p['max_authority']}"
+        if spec.get("push"):
+            return None, False, "standing orders never permit a push"
+        ceiling = p.get("budget_minutes")
+        if ceiling and spec["budget"]["minutes"] > ceiling:
+            return None, False, f"{dec_id} budget ceiling is {ceiling}m"
+        return LEVELS[spec["authority"]], False, f"standing {dec_id}"
+    return None, False, "not approved"
+
+
+def verdict_for(L: Ledger, o: dict, attempt: int | None = None):
+    attempt = attempt or o.get("attempt", 0)
+    rec = L.attempt_record("verdicts", o["id"], attempt)
+    if not rec:
+        return None
+    ok, _ = verify(rec.get("signed"), {"kind": "verdict", "order": o["id"], "attempt": attempt})
+    return rec["signed"]["payload"]["verdict"] if ok else "unverified"
+
+
+# --- spec validation ---------------------------------------------------------
+
+def validate_spec(L: Ledger, spec: dict) -> dict:
+    errs = []
+    if not isinstance(spec, dict):
+        raise StError("order spec must be a JSON object")
+    title = spec.get("title", "")
+    if not isinstance(title, str) or not title.strip():
+        errs.append("title is required")
+    role = spec.get("role", "")
+    if not ROLE_RE.match(str(role)):
+        errs.append(f"role {role!r} is not a team role (copilot, editor, toolsmith, "
+                    "tester, language-lawyer-<lang>)")
+    auth = spec.get("authority", "L0")
+    if auth == "L3":
+        errs.append("L3 is the surgeon's; no order can grant it. Stage the work at L2 "
+                    "and describe what the surgeon must run")
+    elif auth not in LEVELS:
+        errs.append(f"authority must be L0, L1 or L2, not {auth!r}")
+    if not str(spec.get("intent", "")).strip():
+        errs.append("intent is required")
+    scope = spec.get("scope") or {}
+    if not isinstance(scope, dict) or not scope.get("in"):
+        errs.append("scope.in must list what is in scope")
+    acc = spec.get("acceptance")
+    if not isinstance(acc, list) or not acc:
+        errs.append("acceptance must be a non-empty list")
+    else:
+        for i, c in enumerate(acc, 1):
+            if isinstance(c, str):
+                c = {"text": c}
+                acc[i - 1] = c
+            if not isinstance(c, dict) or not str(c.get("text", "")).strip():
+                errs.append(f"acceptance[{i}] needs text")
+            elif "check" in c and not (isinstance(c["check"], str) and c["check"].strip()):
+                errs.append(f"acceptance[{i}].check must be a non-empty command")
+    budget = spec.get("budget") or {}
+    if not isinstance(budget.get("minutes"), int) or budget["minutes"] <= 0:
+        errs.append("budget.minutes must be a positive integer")
+    if spec.get("push") and auth != "L2":
+        errs.append("push is only possible at L2")
+    for dep in spec.get("depends_on", []) or []:
+        if not WO_RE.match(str(dep)) or not L.order_path(dep).exists():
+            errs.append(f"depends_on: no such order {dep}")
+    inputs = spec.get("inputs") or {}
+    for dec in inputs.get("decisions", []) or []:
+        st, _ = decision_status(L, dec)
+        if st != "active":
+            errs.append(f"inputs.decisions: {dec} is {st}")
+    if spec.get("standing") and not DEC_RE.match(str(spec["standing"])):
+        errs.append("standing must be a DEC-NNN id")
+    blind = spec.get("blind", [])
+    if not isinstance(blind, list) or not all(isinstance(b, str) and b and not b.startswith("/")
+                                              and ".." not in b for b in blind):
+        errs.append("blind must be a list of repo-relative paths or globs")
+    if errs:
+        raise StError("invalid order:\n  - " + "\n  - ".join(errs))
+    spec.setdefault("authority", "L0")
+    spec.setdefault("depends_on", [])
+    spec.setdefault("paths", [])
+    spec.setdefault("scope", {}).setdefault("out", [])
+    return spec
+
+
+def read_json_input(args) -> dict:
+    src = Path(args.file).read_text() if getattr(args, "file", None) else sys.stdin.read()
+    try:
+        return json.loads(src)
+    except json.JSONDecodeError as e:
+        raise StError(f"input is not valid JSON: {e}")
+
+
+# --- agent-side commands -----------------------------------------------------
+
+def cmd_draft(args):
+    L = Ledger.at()
+    spec = validate_spec(L, read_json_input(args))
+    with L.lock():
+        wo = L.next_order_id()
+        o = {"id": wo, "spec": spec, "state": "drafted", "revision": 1, "attempt": 0,
+             "created": iso(now()), "history": []}
+        L.save_order(o)
+        L.event("drafted", order=wo, role=spec["role"], authority=spec["authority"])
+        render_status(L)
+    if not any("check" in c for c in spec["acceptance"]):
+        print("warning: no acceptance criterion has a `check`; verification will rest "
+              "on the agent's own report", file=sys.stderr)
+    print(wo)
+
+
+def cmd_revise(args):
+    L = Ledger.at()
+    spec = validate_spec(L, read_json_input(args))
+    with L.lock():
+        o = L.order(args.order)
+        transition(L, o, "drafted", note=args.note or "revised")
+        o["spec"] = spec
+        o["revision"] += 1
+        o.pop("approval", None)
+        L.save_order(o)
+        render_status(L)
+    print(f"{o['id']} revision {o['revision']}: drafted; needs approval again")
+
+
+def _paths_overlap(a: list, b: list) -> bool:
+    for x in a:
+        for y in b:
+            x2, y2 = x.rstrip("/") + "/", y.rstrip("/") + "/"
+            if x2.startswith(y2) or y2.startswith(x2):
+                return True
+    return False
+
+
+def cmd_dispatch(args):
+    L = Ledger.at()
+    with L.lock():
+        o = L.order(args.order)
+        spec = o["spec"]
+        if o["state"] not in ("approved", "drafted"):
+            raise StError(f"{o['id']} is {o['state']}; only approved orders dispatch")
+        level, _push, src = effective_authority(L, o)
+        if level is None:
+            raise StError(f"{o['id']} has no valid authority: {src}")
+        for n in range(1, o.get("attempt", 0) + 1):
+            if verdict_for(L, o, n) in ("accepted", "rejected"):
+                raise StError(f"{o['id']} already has a signed verdict (attempt {n}); its state "
+                              "was rolled back. Run `st verify`; new work needs a new order")
+        if o["state"] == "drafted" and o.get("attempt", 0) and o.get("approval"):
+            raise StError(f"{o['id']} is drafted but still carries an approval; run `st verify`")
+        leases = Leases(L.root)
+        grant = grant_id(o)
+        if leases.consumed(grant):
+            raise StError(f"{o['id']}: this grant already backed a reported attempt. To run the "
+                          "order again, `st revise` it and have the surgeon approve the new spec")
+        for dep in spec["depends_on"]:
+            d = L.order(dep)
+            if verdict_for(L, d) != "accepted" or d["state"] != "accepted":
+                raise StError(f"{o['id']} depends on {dep}, which is {d['state']}, not accepted")
+        if spec["paths"] and not args.allow_overlap:
+            for other in L.orders():
+                if other["id"] != o["id"] and other["state"] == "dispatched" \
+                        and _paths_overlap(spec["paths"], other["spec"].get("paths", [])):
+                    raise StError(f"{o['id']} overlaps in-flight {other['id']} on paths; "
+                                  "serialize them (depends_on) or pass --allow-overlap")
+        ws, branch = None, None
+        if level >= 1:
+            ws = L.workspace(o["id"])
+            branch = f"st/{o['id']}-{slugify(spec['title'])}"
+            if not ws.exists():
+                ws.parent.mkdir(parents=True, exist_ok=True)
+                base = spec.get("base") or "HEAD"
+                exists = git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                             L.root, check=False)
+                cmd = ["worktree", "add", str(ws), branch] if exists else \
+                      ["worktree", "add", "-b", branch, str(ws), base]
+                git(cmd, L.root)
+        o["attempt"] += 1
+        appr = o.get("approval")
+        not_after = appr["payload"]["not_after"] if appr else \
+            iso(now() + dt.timedelta(minutes=3 * spec["budget"]["minutes"]))
+        leases.close(o["id"], "superseded")
+        leases.append(event="open", order=o["id"], attempt=o["attempt"], grant=grant,
+                      spec_sha=sha(spec), role=spec["role"], not_after=not_after)
+        o["dispatch"] = {"at": iso(now()), "attempt": o["attempt"], "authority_source": src,
+                         "workspace": str(ws) if ws else None, "branch": branch,
+                         "not_after": not_after}
+        transition(L, o, "dispatched", note=f"attempt {o['attempt']} via {src}")
+        L.save_order(o)
+        render_status(L)
+    print(briefing(L, o))
+
+
+def briefing(L: Ledger, o: dict) -> str:
+    spec = o["spec"]
+    level, push, src = effective_authority(L, o)
+    d = o.get("dispatch") or {}
+    lines = [
+        f"# Work order {o['id']} (attempt {o.get('attempt', 0)}): {spec['title']}",
+        "",
+        f"Role: {spec['role']}    Authority: L{level} ({src})    "
+        f"Push: {'permitted' if push else 'not permitted'}",
+        f"Workspace: {d.get('workspace') or 'none (L0: read in place, change nothing)'}",
+        f"Branch: {d.get('branch') or '-'}    Authority expires: {d.get('not_after') or '-'}",
+        f"Ledger: {L.dir} (read-only to you; file through `st`)",
+        "",
+        "The guard hook enforces this authority. A blocked call is outside the order: never "
+        "get the same effect another way. Continue with what is within the order and quote "
+        "the block in your report; report BLOCKED only if it stops the order itself.",
+        "",
+        "## Order",
+        "```json",
+        json.dumps(spec, indent=2, ensure_ascii=False),
+        "```",
+    ]
+    decs = (spec.get("inputs") or {}).get("decisions", []) or []
+    if decs:
+        lines += ["", "## Decisions in force for this order"]
+        for dec in decs:
+            st, rec = decision_status(L, dec)
+            p = rec["signed"]["payload"] if rec else {}
+            lines.append(f"- {dec} [{st}] {p.get('title', '')}: {p.get('decision', '')}")
+    lines += ["", "## Reporting",
+              f"When finished, file exactly one report for this attempt:",
+              f"  st report {o['id']} <<'EOF'",
+              '  {"status": "DONE|PARTIAL|BLOCKED|DECLINED", "summary": "...",',
+              '   "criteria": [{"met": true, "evidence": "..."}],',
+              '   "evidence": "...", "risks": "...", "recommended": "...",',
+              '   "out_of_scope": [], "blocker": "", "cost": {"tokens": 0}}',
+              "  EOF",
+              "criteria has one entry per acceptance criterion, in order. The harness "
+              "re-runs every `check` itself; your evidence does not substitute for it."]
+    return "\n".join(lines)
+
+
+def cmd_brief(args):
+    L = Ledger.at()
+    print(briefing(L, L.order(args.order)))
+
+
+def cmd_report(args):
+    L = Ledger.at()
+    rep = read_json_input(args)
+    errs = []
+    status = rep.get("status")
+    if status not in REPORT_STATUSES:
+        errs.append(f"status must be one of {sorted(REPORT_STATUSES)}")
+    if not str(rep.get("summary", "")).strip():
+        errs.append("summary is required")
+    with L.lock():
+        o = L.order(args.order)
+        if o["state"] != "dispatched":
+            raise StError(f"{o['id']} is {o['state']}; reports are filed against a dispatched order")
+        if L.attempt_record("reports", o["id"], o["attempt"]):
+            raise StError(f"{o['id']} attempt {o['attempt']} already has a report; one per attempt")
+        lease = Leases(L.root).open_leases().get(o["id"])
+        if not lease:
+            raise StError(f"{o['id']} has no live dispatch on this machine; it was dispatched "
+                          "elsewhere, reclaimed, or its ledger state was edited")
+        n = len(o["spec"]["acceptance"])
+        crit = rep.get("criteria", [])
+        if status in ("DONE", "PARTIAL") and (not isinstance(crit, list) or len(crit) != n):
+            errs.append(f"criteria must have exactly {n} entries, one per acceptance criterion")
+        if status == "DONE" and isinstance(crit, list) and not all(c.get("met") for c in crit):
+            errs.append("DONE requires every criterion met; use PARTIAL")
+        if status in ("BLOCKED", "DECLINED") and not str(rep.get("blocker", "")).strip():
+            errs.append(f"{status} requires a blocker: what stopped you and what would unblock it")
+        if errs:
+            raise StError("invalid report:\n  - " + "\n  - ".join(errs))
+        at = now()
+        started = parse_iso(o["dispatch"]["at"])
+        rec = {"order": o["id"], "attempt": o["attempt"], "filed": iso(at),
+               "wall_clock_minutes": round((at - started).total_seconds() / 60, 1),
+               "report": rep}
+        L._write(L.attempt_path("reports", o["id"], o["attempt"]), rec)
+        Leases(L.root).close(o["id"], "reported")
+        transition(L, o, "reported", note=status)
+        L.save_order(o)
+        render_status(L)
+    print(f"{o['id']} attempt {o['attempt']}: {status} filed; awaiting the surgeon's verdict")
+
+
+def cmd_check(args):
+    L = Ledger.at()
+    o = L.order(args.order)
+    if o["state"] not in ("dispatched", "reported", "deferred"):
+        raise StError(f"{o['id']} is {o['state']}; nothing to check")
+    level, _, src = effective_authority(L, o)
+    if level is None and not src.startswith("approval expired"):
+        # Checks are shell commands; run only ones the surgeon signed. An
+        # expired approval still proves the surgeon signed these commands;
+        # expiry bounds agent authority, not re-running the checks.
+        raise StError(f"refusing to run checks: {o['id']} has no valid authority ({src})")
+    cwd = Path(o["dispatch"]["workspace"]) if o.get("dispatch", {}).get("workspace") else L.root
+    head = git(["rev-parse", "HEAD"], cwd, check=False)
+    dirty = bool(git(["status", "--porcelain"], cwd, check=False))
+    timeout = int(o["spec"].get("check_timeout", DEFAULT_CHECK_TIMEOUT))
+    results, ok_all = [], True
+    for i, c in enumerate(o["spec"]["acceptance"], 1):
+        if "check" not in c:
+            results.append({"n": i, "text": c["text"], "check": None, "ok": None})
+            continue
+        try:
+            r = subprocess.run(c["check"], shell=True, cwd=cwd, capture_output=True,
+                               text=True, timeout=timeout)
+            out, code = (r.stdout + r.stderr)[-4000:], r.returncode
+        except subprocess.TimeoutExpired:
+            out, code = f"timed out after {timeout}s", None
+        ok = code == 0
+        ok_all &= ok
+        results.append({"n": i, "text": c["text"], "check": c["check"], "exit": code,
+                        "ok": ok, "output_tail": out})
+    run = {"at": iso(now()), "cwd": str(cwd), "head": head, "dirty": dirty, "results": results}
+    with L.lock():
+        p = L.attempt_path("checks", o["id"], o["attempt"])
+        rec = L._read(p) if p.exists() else {"order": o["id"], "attempt": o["attempt"], "runs": []}
+        rec["runs"].append(run)
+        L._write(p, rec)
+        L.event("checked", order=o["id"], attempt=o["attempt"], ok=ok_all)
+        render_status(L)
+    for r in results:
+        mark = "-" if r["ok"] is None else ("PASS" if r["ok"] else "FAIL")
+        print(f"  [{mark}] {r['n']}. {r['text']}")
+    print(f"{o['id']}: {'all checks passed' if ok_all else 'CHECKS FAILED'} "
+          f"at {head[:12]}{' (dirty tree)' if dirty else ''}")
+    return 0 if ok_all else 1
+
+
+def cmd_reclaim(args):
+    L = Ledger.at()
+    with L.lock():
+        o = L.order(args.order)
+        if o["state"] != "dispatched":
+            raise StError(f"{o['id']} is {o['state']}, not dispatched")
+        to = "approved" if o.get("approval") else "drafted"
+        Leases(L.root).close(o["id"], "reclaimed")
+        transition(L, o, to, note=f"reclaimed: {args.reason}")
+        L.save_order(o)
+        render_status(L)
+    print(f"{o['id']} reclaimed to {to}; the workspace is kept. Dispatch again to retry.")
+
+
+def cmd_journal(args):
+    L = Ledger.at()
+    text = sys.stdin.read().strip()
+    if not text:
+        raise StError("journal entry is empty")
+    with L.lock():
+        p = L.dir / "journal" / f"{now().strftime('%Y-%m-%d')}.md"
+        with open(p, "a") as fh:
+            fh.write(f"\n## {iso(now())}\n\n{text}\n")
+        L.event("journal", file=p.name)
+    print(f"appended to {p.relative_to(L.root)}")
+
+
+def cmd_show(args):
+    L = Ledger.at()
+    o = L.order(args.order)
+    level, push, src = effective_authority(L, o)
+    out = {"order": o, "authority": {"level": level, "push": push, "source": src},
+           "verdict": verdict_for(L, o)}
+    for kind in ("reports", "checks"):
+        out[kind[:-1]] = L.attempt_record(kind, o["id"], o.get("attempt", 0))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def cmd_list(args):
+    L = Ledger.at()
+    for o in L.orders():
+        if args.state and o["state"] != args.state:
+            continue
+        s = o["spec"]
+        print(f"{o['id']}  {o['state']:<10} {s['role']:<22} {s['authority']}  {s['title']}")
+
+
+def cmd_verify(args):
+    L = Ledger.at()
+    problems = integrity_problems(L)
+    for p in problems:
+        print(f"  {p}")
+    print("ledger signatures verified" if not problems else f"{len(problems)} integrity problem(s)")
+    return 1 if problems else 0
+
+
+def integrity_problems(L: Ledger) -> list[str]:
+    probs = []
+    for o in L.orders():
+        if o.get("approval"):
+            ok, why = verify(o["approval"], {"kind": "approve", "order": o["id"],
+                                             "spec_sha": sha(o["spec"])})
+            if not ok:
+                probs.append(f"{o['id']}: approval {why}")
+        elif o["state"] in ("approved",):
+            probs.append(f"{o['id']}: state approved with no approval record")
+        if o["state"] in ("accepted", "rejected"):
+            v = verdict_for(L, o)
+            if v != o["state"]:
+                probs.append(f"{o['id']}: state {o['state']} but verified verdict is {v}")
+        if o["state"] == "cancelled":
+            ok, _ = verify(o.get("cancellation"), {"kind": "cancel", "order": o["id"]})
+            if not ok:
+                probs.append(f"{o['id']}: cancelled without a verified cancellation")
+        if o["state"] == "dispatched" and (
+                L.attempt_record("reports", o["id"], o.get("attempt", 0))
+                or L.attempt_record("verdicts", o["id"], o.get("attempt", 0))):
+            probs.append(f"{o['id']}: state dispatched but attempt {o.get('attempt')} was "
+                         "already reported (state rolled back?)")
+        for n in range(1, o.get("attempt", 0) + 1):
+            v = verdict_for(L, o, n)
+            if v in ("accepted", "rejected") and o["state"] not in TERMINAL:
+                probs.append(f"{o['id']}: signed verdict {v} on attempt {n} but state is {o['state']}")
+    for d in L.decisions():
+        ok, why = verify(d.get("signed"), {"id": d.get("id")})
+        if not ok:
+            probs.append(f"{d.get('id')}: {why}")
+    return probs
+
+
+# --- status ------------------------------------------------------------------
+
+def status_lines(L: Ledger) -> list[str]:
+    t = now()
+    orders = L.orders()
+    live_ids = {o["id"] for o, *_ in live_orders(L)}
+    awaiting, inflight, blocked, ready = [], [], [], []
+    for o in orders:
+        s, st = o["spec"], o["state"]
+        tag = f"{o['id']}  {s['role']}  {s['authority']}  {s['title']}"
+        if st == "drafted":
+            level, _, src = effective_authority(L, o)
+            if level is not None:
+                ready.append(f"{tag}  (covered by {src})")
+            else:
+                awaiting.append(f"approve: {tag}")
+        elif st == "approved":
+            ready.append(tag)
+        elif st == "dispatched":
+            started = parse_iso(o["dispatch"]["at"])
+            mins = (t - started).total_seconds() / 60
+            budget = s["budget"]["minutes"]
+            flag = "" if o["id"] in live_ids else "  NO LIVE LEASE HERE (no authority)"
+            if mins > budget * STALE_FACTOR:
+                flag += "  STALE: no report; reclaim or chase"
+            elif mins > budget:
+                flag += "  OVER BUDGET"
+            inflight.append(f"{tag}  {mins:.0f}m/{budget}m{flag}")
+        elif st in ("reported", "deferred"):
+            rep = L.attempt_record("reports", o["id"], o["attempt"]) or {}
+            rstatus = (rep.get("report") or {}).get("status", "?")
+            chk = L.attempt_record("checks", o["id"], o["attempt"])
+            if chk:
+                last = chk["runs"][-1]["results"]
+                ran = [r for r in last if r["ok"] is not None]
+                cstr = f"checks {sum(r['ok'] for r in ran)}/{len(ran)} pass"
+            elif any("check" in c for c in s["acceptance"]):
+                cstr = "checks NOT RUN"
+            else:
+                cstr = "no executable checks"
+            line = f"verdict: {tag}  {rstatus}, {cstr}" + ("  (deferred)" if st == "deferred" else "")
+            (blocked if rstatus in ("BLOCKED", "DECLINED") else awaiting).append(line)
+    standing, recent = [], []
+    for d in L.decisions():
+        stt, rec = decision_status(L, d["id"])
+        p = rec["signed"]["payload"] if rec and rec.get("signed") else {}
+        if p.get("kind") == "standing" and stt == "active":
+            standing.append(f"{d['id']}: {p['role']} up to {p['max_authority']}, "
+                            f"{p.get('budget_minutes', '-')}m, until {p.get('expires', 'revoked')}: "
+                            f"{p.get('scope', '')}")
+        elif p.get("kind") == "decision" and stt == "active":
+            recent.append(f"{d['id']} {p.get('title', '')}")
+    ws = [f"{o['id']}  {o['dispatch']['workspace']}  ({o['dispatch']['branch']})"
+          for o in orders if o.get("dispatch", {}).get("workspace") and o["state"] not in TERMINAL]
+    probs = integrity_problems(L)
+    out = [f"# Status — {iso(t)}", "",
+           "Generated by `st`. Do not edit; it is rebuilt on every ledger change.", ""]
+
+    def section(title, items, empty="none"):
+        out.extend([f"## {title}", *([f"- {i}" for i in items] or [f"- {empty}"]), ""])
+    if probs:
+        section("INTEGRITY PROBLEMS (run `st verify`)", probs)
+    section("Awaiting the surgeon", awaiting)
+    section("Blocked or declined", blocked)
+    section("In flight", inflight)
+    section("Ready to dispatch", ready)
+    section("Standing orders in force", standing)
+    section("Recent decisions", recent[-5:])
+    section("Live workspaces", ws)
+    return out
+
+
+def render_status(L: Ledger):
+    (L.dir / "STATUS.md").write_text("\n".join(status_lines(L)))
+
+
+def cmd_status(args):
+    L = Ledger.at()
+    L.require()
+    lines = status_lines(L)
+    (L.dir / "STATUS.md").write_text("\n".join(lines))
+    print("\n".join(lines))
+
+
+# --- surgeon-only commands ---------------------------------------------------
+
+def cmd_setup(args):
+    key = Path(args.key).expanduser().resolve()
+    pub = key if key.suffix == ".pub" else key.with_name(key.name + ".pub")
+    if not pub.exists():
+        raise StError(f"no public key at {pub}")
+    # The guard stops agents from *running* ssh-keygen, but code an agent runs
+    # inside its workspace is not parsed. If the key signs without the
+    # surgeon (no passphrase, no touch), that code could sign an approval.
+    hardware = pub.read_text().startswith("sk-")
+    if key != pub and not hardware and not args.allow_unencrypted:
+        r = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", str(key)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            raise StError(
+                f"{key} has no passphrase, so any process running as you can sign approvals "
+                "with it, including code an agent runs in its workspace. Use a passphrase "
+                "key, a hardware key (ed25519-sk), or an ssh-agent key added with "
+                "`ssh-add -c` (pass the .pub path). --allow-unencrypted overrides this for "
+                "throwaway test setups.")
+    d = config_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    cfg = load_config()
+    cfg.update({"key": str(key), "identity": args.identity})
+    (d / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    line = f'{args.identity} namespaces="{NAMESPACE}" {pub.read_text().strip()}\n'
+    signers = d / "allowed_signers"
+    existing = signers.read_text() if signers.exists() else ""
+    if line not in existing:
+        with open(signers, "a") as fh:
+            fh.write(line)
+    print(f"configured {args.identity} with {key}\ntrust root: {signers}")
+
+
+def cmd_init(args):
+    L = Ledger.at()
+    L.dir.mkdir(exist_ok=True)
+    for s in Ledger.SUBDIRS:
+        (L.dir / s).mkdir(exist_ok=True)
+    gi = L.dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text(".lock\n*.tmp\n")
+    L.event("init", version=VERSION)
+    if args.default_standing:
+        with L.lock():
+            dec = L.next_decision_id()
+            payload = {"kind": "standing", "id": dec, "role": "*", "max_authority": "L0",
+                       "budget_minutes": 30, "scope": "Read-only analysis, review, and "
+                       "option papers; no changes anywhere", "expires": None,
+                       "title": "Default standing order: L0 work needs no per-order approval",
+                       "at": iso(now())}
+            L._write(L.dir / "decisions" / f"{dec}.json", {"id": dec, "signed": sign(payload)})
+            L.event("decided", decision=dec, kind="standing")
+        print(f"filed {dec}: L0 orders for every role dispatch without per-order approval")
+    render_status(L)
+    print(f"ledger ready at {L.dir}; commit it with the project")
+
+
+def cmd_approve(args):
+    L = Ledger.at()
+    with L.lock():
+        o = L.order(args.order)
+        if o["state"] != "drafted":
+            raise StError(f"{o['id']} is {o['state']}; only drafted orders are approved")
+        level = args.level or o["spec"]["authority"]
+        if level not in LEVELS:
+            raise StError("approval level must be L0, L1 or L2")
+        if args.push and level != "L2":
+            raise StError("a push can only be approved at L2")
+        if LEVELS[level] < LEVELS[o["spec"]["authority"]]:
+            print(f"note: approving below the drafted {o['spec']['authority']}; check that "
+                  "the acceptance criteria are still achievable", file=sys.stderr)
+        minutes = args.valid_for or max(60, 3 * o["spec"]["budget"]["minutes"])
+        not_after = iso(now() + dt.timedelta(minutes=minutes))
+        o["approval"] = sign({"kind": "approve", "order": o["id"], "spec_sha": sha(o["spec"]),
+                              "authority": level, "push": bool(args.push), "at": iso(now()),
+                              "not_after": not_after})
+        transition(L, o, "approved", note=f"{level}{' +push' if args.push else ''}", by="surgeon")
+        L.save_order(o)
+        render_status(L)
+    print(f"{o['id']} approved at {level}{' with push' if args.push else ''}, "
+          f"valid until {not_after}")
+
+
+def _verdict(args, verdict):
+    L = Ledger.at()
+    with L.lock():
+        for wo in args.orders:
+            o = L.order(wo)
+            if o["state"] not in ("reported", "deferred"):
+                raise StError(f"{wo} is {o['state']}; verdicts apply to reported orders")
+            rep = L.attempt_record("reports", wo, o["attempt"])
+            chk = L.attempt_record("checks", wo, o["attempt"])
+            if verdict == "accepted":
+                if any("check" in c for c in o["spec"]["acceptance"]) and not chk:
+                    print(f"warning: {wo} has executable checks that were never run "
+                          f"(st check {wo})", file=sys.stderr)
+                elif chk and not all(r["ok"] is not False for r in chk["runs"][-1]["results"]):
+                    print(f"warning: {wo}: the last check run FAILED", file=sys.stderr)
+            payload = {"kind": "verdict", "order": wo, "attempt": o["attempt"],
+                       "verdict": verdict, "report_sha": sha(rep) if rep else None,
+                       "note": args.message or "", "at": iso(now())}
+            L._write(L.attempt_path("verdicts", wo, o["attempt"]),
+                     {"order": wo, "attempt": o["attempt"], "signed": sign(payload)})
+            Leases(L.root).close(wo, "verdict")
+            transition(L, o, verdict, note=args.message or "", by="surgeon")
+            L.save_order(o)
+            print(f"{wo}: {verdict}")
+        render_status(L)
+
+
+def cmd_cancel(args):
+    L = Ledger.at()
+    with L.lock():
+        o = L.order(args.order)
+        o["cancellation"] = sign({"kind": "cancel", "order": o["id"],
+                                  "reason": args.message or "", "at": iso(now())})
+        Leases(L.root).close(o["id"], "cancelled")
+        transition(L, o, "cancelled", note=args.message or "", by="surgeon")
+        L.save_order(o)
+        render_status(L)
+    print(f"{o['id']}: cancelled")
+
+
+def _file_decision(L, payload):
+    with L.lock():
+        dec = L.next_decision_id()
+        payload = {**payload, "id": dec, "at": iso(now())}
+        L._write(L.dir / "decisions" / f"{dec}.json", {"id": dec, "signed": sign(payload)})
+        L.event("decided", decision=dec, kind=payload["kind"])
+        render_status(L)
+    return dec
+
+
+def cmd_decide(args):
+    L = Ledger.at()
+    L.require()
+    if args.supersedes:
+        st, _ = decision_status(L, args.supersedes)
+        if st != "active":
+            raise StError(f"{args.supersedes} is {st}; only active decisions are superseded")
+    dec = _file_decision(L, {"kind": "decision", "title": args.title,
+                             "decision": args.decision, "why": args.why or "",
+                             "consequences": args.consequence or [],
+                             "alternatives": args.rejected or [], "scope": args.scope or "",
+                             "context": args.context or "", "supersedes": args.supersedes,
+                             "expires": args.expires})
+    print(dec)
+
+
+def cmd_grant(args):
+    L = Ledger.at()
+    L.require()
+    if args.max not in LEVELS:
+        raise StError("a standing order grants at most L2, never L3")
+    if args.role != "*" and not ROLE_RE.match(args.role):
+        raise StError(f"unknown role {args.role}")
+    if args.expires:
+        dt.date.fromisoformat(args.expires)
+    dec = _file_decision(L, {"kind": "standing", "role": args.role, "max_authority": args.max,
+                             "budget_minutes": args.budget, "scope": args.scope,
+                             "expires": args.expires,
+                             "title": f"Standing order: {args.role} up to {args.max}"})
+    print(dec)
+
+
+def cmd_revoke(args):
+    L = Ledger.at()
+    L.require()
+    st, _ = decision_status(L, args.decision)
+    if st != "active":
+        raise StError(f"{args.decision} is {st}")
+    dec = _file_decision(L, {"kind": "revoke", "target": args.decision,
+                             "reason": args.message or "",
+                             "title": f"Revoke {args.decision}"})
+    print(dec)
+
+
+# --- guard -------------------------------------------------------------------
+
+TOOL_ALIASES = {
+    "write": "write", "fs_write": "write", "fsWrite": "write",
+    "read": "read", "fs_read": "read", "fsRead": "read",
+    "shell": "shell", "execute_bash": "shell", "executeBash": "shell",
+    "execute_cmd": "shell", "executeCmd": "shell",
+    "subagent": "subagent", "agent_crew": "subagent", "use_subagent": "subagent",
+    "task": "todo_list", "todo": "todo_list", "todo_list": "todo_list",
+    "web_search": "web_search", "websearch": "web_search",
+    "web_fetch": "web_fetch", "webfetch": "web_fetch",
+    "grep": "grep", "glob": "glob", "code": "code", "summary": "summary",
+}
+KNOWN_TOOLS = {"read", "write", "shell", "subagent", "grep", "glob", "code",
+               "web_search", "web_fetch", "todo_list", "summary"}
+CODE_WRITE_OPS = {"pattern_rewrite", "rename_symbol", "apply_code_action", "format"}
+SHELL_OPS = {";", "&&", "||", "|", "&", "|&", "(", ")", "{", "}"}
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&"}
+READ_REDIRECTS = {"<", "<<", "<<<", "<&"}
+FILE_MUTATORS = {"rm", "rmdir", "mv", "cp", "mkdir", "touch", "tee", "ln", "chmod",
+                 "chown", "truncate", "install", "rsync", "unlink", "shred"}
+INPLACE_EDITORS = {"sed", "perl", "ruby"}
+INTERPRETERS = {"python": "-c", "python3": "-c", "node": "-e", "perl": "-e",
+                "ruby": "-e", "bash": "-c", "sh": "-c", "zsh": "-c", "osascript": "-e"}
+# Programs that may run anywhere, including at L0 outside any workspace.
+# Everything else (builds, test runners, scripts, interpreters) runs only
+# with the working directory inside an order's workspace: test runners
+# write artifacts, so "read-only test run" is not a thing (F-14).
+READONLY_PROGS = {"cat", "less", "head", "tail", "ls", "rg", "grep", "egrep", "fgrep",
+                  "wc", "jq", "stat", "file", "diff", "find", "pwd", "echo", "printf",
+                  "true", "false", "which", "type", "date", "tree", "du", "df", "uname",
+                  "whoami", "basename", "dirname", "realpath", "readlink", "sort", "uniq",
+                  "cut", "tr", "column", "nl", "fold", "comm", "cmp", "shasum", "sha256sum",
+                  "md5", "md5sum", "test", "[", "sleep", "sed", "fd", "bat", "hexdump",
+                  "xxd", "od", "strings", "man", "rustc", "cargo-metadata"}
+WRAPPERS = {"command", "env", "time", "nohup", "nice", "xargs", "exec", "builtin"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+GUARDED_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+               "GIT_OBJECT_DIRECTORY", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+               "ST_CONFIG_DIR", "ST_NOW", "HOME"}
+UNRESOLVED = re.compile(r"[$`]")  # variable or command expansion the guard cannot evaluate
+GIT_READ = {"status", "log", "diff", "show", "blame", "rev-parse", "ls-files", "grep",
+            "describe", "shortlog", "cat-file", "ls-tree", "rev-list", "fetch",
+            "merge-base", "name-rev", "for-each-ref", "show-ref", "help", "version"}
+GIT_WORKTREE_OPS = {"add", "restore", "rm", "mv", "apply", "stash", "checkout", "switch"}
+GIT_HISTORY_OPS = {"commit", "cherry-pick", "revert", "am", "notes"}
+GIT_ALWAYS_DENY = {"rebase", "merge", "filter-branch", "filter-repo", "update-ref",
+                   "replace", "gc", "prune", "pull"}
+
+
+def strip_heredocs(cmd: str) -> str:
+    out, pending = [], []
+    for line in cmd.split("\n"):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        for m in re.finditer(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line):
+            pending.append(m.group(2))
+        out.append(re.sub(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", "", line))
+    return "\n".join(out)
+
+
+def shell_segments(cmd: str) -> list[list[str]]:
+    lex = shlex.shlex(strip_heredocs(cmd).replace("\n", " ; "), posix=True,
+                      punctuation_chars=";&|()<>{}")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    segs, cur = [], []
+    for tok in lex:
+        if tok in SHELL_OPS:
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+class Guard:
+    def __init__(self, role: str, cwd: Path):
+        self.role = role
+        self.cwd = cwd.resolve()
+        self.home = Path.home().resolve()
+        self.st_path = Path(__file__).resolve()
+        self.L = None
+        with contextlib.suppress(StError, FileNotFoundError, OSError):
+            self.L = Ledger.at(self.cwd)
+        self.active = []  # (order, level, push, workspace)
+        self.live = []
+        if self.L and self.L.exists():
+            # Authority comes from the local lease store and signatures, never
+            # from the ledger's state field. The workspace is derived from the
+            # order ID, never read from the (unsigned) dispatch record.
+            self.live = live_orders(self.L)
+            for o, _lease, level, push in self.live:
+                if o["spec"]["role"] != role:
+                    continue
+                ws = self.L.workspace(o["id"]) if level >= 1 else None
+                self.active.append((o, level, push, ws))
+        cfg = load_config()
+        key = cfg.get("key")
+        self.secrets = [self.home / ".ssh"]
+        if key:
+            k = Path(key)
+            self.secrets.append(k.with_suffix("") if k.suffix == ".pub" else k)
+        self.protected = [p for p in [
+            self.L.dir if self.L else None, config_dir(), self.home / ".kiro" / "agents",
+            (self.L.root / ".kiro") if self.L else None, self.st_path.parent.parent,
+            self.home / ".ssh"] if p is not None]
+
+    # helpers
+    def resolve(self, p, base: Path) -> Path:
+        p = Path(os.path.expanduser(str(p)))
+        return (p if p.is_absolute() else base / p).resolve()
+
+    def workspaces(self, min_level=1):
+        return [(o, lvl, push, ws) for o, lvl, push, ws in self.active if lvl >= min_level and ws]
+
+    def ws_for(self, path: Path, min_level=1):
+        for entry in self.workspaces(min_level):
+            if is_within(path, entry[3]):
+                return entry
+        return None
+
+    def no_ws_msg(self, what):
+        held = ", ".join(f"{o['id']} L{lvl}" for o, lvl, _, _ in self.active) or "no active order"
+        return (f"{what} is outside any workspace this role ({self.role}) may change "
+                f"[{held}]. Report the need instead of working around it.")
+
+    def protected_hit(self, path: Path):
+        for p in self.protected:
+            if is_within(path, p):
+                return p
+        return None
+
+    def check_subagent(self, inp: dict):
+        """Every stage must run a guarded team agent on a dispatched order for its role.
+
+        A stage on a generic agent (no guard hook) would escape authority
+        entirely, so it is refused.
+        """
+        stages = inp.get("stages") or []
+        if not stages:
+            return "subagent call without stages"
+        if not (self.L and self.L.exists()):
+            return "no ledger; the surgeon runs `st init` before the team can be dispatched"
+        dispatched = {o["id"]: o for o, *_ in self.live}
+        for s in stages:
+            agent = str(s.get("role", ""))
+            role = agent[len(AGENT_PREFIX):] if agent.startswith(AGENT_PREFIX) else None
+            if not role or not ROLE_RE.match(role):
+                return (f"stage {s.get('name')!r} uses agent {agent!r}; team work runs only on "
+                        f"guarded {AGENT_PREFIX}<role> agents")
+            ids = set(re.findall(r"WO-\d{8}-\d{3}", str(s.get("prompt_template", ""))))
+            match = [i for i in ids if i in dispatched and dispatched[i]["spec"]["role"] == role]
+            if len(match) != 1:
+                return (f"stage {s.get('name')!r} must carry the briefing of exactly one order "
+                        f"dispatched to {role} (run `st dispatch WO-…` and pass its output)")
+        return None
+
+    def blind_hit(self, p: Path):
+        """F-13: an order may withhold paths (usually the implementation) from its role."""
+        import fnmatch
+        for o, _lvl, _push, ws in self.active:
+            for pat in o["spec"].get("blind", []) or []:
+                for base in [self.L.root] + ([ws] if ws else []):
+                    try:
+                        rel = p.resolve().relative_to(base.resolve()).as_posix()
+                    except ValueError:
+                        continue
+                    pat2 = pat.rstrip("/")
+                    if fnmatch.fnmatch(rel, pat2) or rel == pat2 or rel.startswith(pat2 + "/"):
+                        return o["id"], pat
+        return None
+
+    def blind_parent(self, p: Path):
+        """A content search rooted above a withheld path would reveal it."""
+        for o, _l, _p, ws in self.active:
+            for pat in o["spec"].get("blind", []) or []:
+                for base in [self.L.root] + ([ws] if ws else []):
+                    target = (base / pat.split("*")[0]).resolve()
+                    if is_within(target, p) and p.resolve() != target:
+                        return (f"{o['id']} is a blind order and a content search of {p} would "
+                                f"include {pat}. This is not a stop: search a narrower path, or "
+                                "add a glob that excludes it")
+        return None
+
+    # tools
+    def check_read(self, inp: dict, tool: str = "read"):
+        paths, listing = [], tool == "glob"
+        for op in inp.get("operations", []) or []:
+            if op.get("path"):
+                paths.append((op["path"], op.get("mode") == "Directory"))
+            paths.extend((ip, False) for ip in op.get("image_paths", []) or [])
+        for key in ("path", "file_path"):
+            if inp.get(key):
+                paths.append((inp[key], listing))
+        if tool in ("grep", "code") and not paths:
+            paths.append((str(self.cwd), False))
+        for raw, is_listing in paths:
+            p = self.resolve(raw, self.cwd)
+            for s in self.secrets:
+                if is_within(p, s) and not p.name.endswith(".pub") and p.name != "known_hosts":
+                    return f"reading {p} is denied: signing and SSH key material"
+            if is_listing:
+                continue  # names are not contents
+            hit = self.blind_hit(p)
+            if hit:
+                return (f"{hit[0]} is a blind order: {hit[1]} is withheld so that you work from "
+                        "the spec, not the implementation. Read the spec and public interface "
+                        "instead; do not try to infer the withheld code")
+            if tool in ("grep", "code") and p.is_dir() and not inp.get("include"):
+                why = self.blind_parent(p)
+                if why:
+                    return why
+        return None
+
+    def check_write_path(self, p: Path, what="write"):
+        if str(p) == "/dev/null":
+            return None
+        hit = self.protected_hit(p)
+        if not hit and LEDGER_DIRNAME in p.parts:
+            hit = p
+        if hit:
+            return (f"{what} to {p} is denied: {hit} is control-plane state (ledger, trust "
+                    "root, agent configs, or the st tool). File through `st` commands.")
+        if self.ws_for(p):
+            return None
+        return self.no_ws_msg(f"{what} to {p}")
+
+    def check_shell(self, cmd: str, cwd: Path):
+        try:
+            segs = shell_segments(cmd)
+        except ValueError as e:
+            return f"could not parse the command ({e}); simplify it"
+        text = cmd
+        marks = [LEDGER_DIRNAME, str(config_dir()), "allowed_signers", ".kiro/agents"]
+        if any(m in text for m in marks):
+            for seg in segs:
+                raw = str(self.program(self.strip_redirects(seg)[0])[0] or "")
+                prog = Path(raw).name
+                if prog in ("sed", "find") or (prog not in READONLY_PROGS and
+                                               prog not in ("st", "git")):
+                    return ("this command references control-plane state; only `st` and "
+                            "read-only viewers may touch it")
+        cur = cwd.resolve()
+        if re.search(r"\$\(|`|<\(|>\(", strip_heredocs(cmd)) and not self.ws_for(cur):
+            return ("command or process substitution outside a workspace is denied: the guard "
+                    "cannot see what it runs")
+        for seg in segs:
+            words = self.strip_redirects(seg)
+            # redirections
+            for target in words[1]:
+                if UNRESOLVED.search(target):
+                    return f"redirect target {target!r} cannot be resolved by the guard"
+                why = self.check_write_path(self.resolve(target, cur), "redirect")
+                if why:
+                    return why
+            seg = words[0]
+            prog, args, env, wrappers = self.program(seg, full=True)
+            for var in env:
+                if var in GUARDED_ENV:
+                    return f"setting {var} is denied: it redirects git or st away from the order"
+            if prog is None:
+                continue
+            name = Path(prog).name
+            if name in ("export", "declare", "typeset", "set", "unset") and \
+                    any(a.split("=")[0] in GUARDED_ENV for a in args):
+                return "changing GIT_* or ST_* variables is denied"
+            if name in ("cd", "pushd"):
+                target = next((a for a in args if not a.startswith("-") or a == "-"), None)
+                if target is None:
+                    cur = self.home
+                elif target == "-" or UNRESOLVED.search(target):
+                    return f"`{name} {target}` cannot be resolved by the guard; use a literal path"
+                else:
+                    cur = self.resolve(target, cur)
+                continue
+            if name == "popd":
+                return "popd cannot be resolved by the guard; use `cd` with a literal path"
+            if "xargs" in wrappers and name not in READONLY_PROGS:
+                return f"`xargs {name}` hides its arguments from the guard"
+            if name in SHELLS and "-c" in args:
+                inner = args[args.index("-c") + 1] if args.index("-c") + 1 < len(args) else ""
+                why = self.check_shell(inner, cur)
+                if why:
+                    return why
+                continue
+            if name in READONLY_PROGS or name == "git":
+                file_args = [a for a in args if not a.startswith("-")]
+                for a in file_args:
+                    if "/" not in a and not (cur / a).exists():
+                        continue
+                    hit = self.blind_hit(self.resolve(a, cur))
+                    if hit:
+                        return f"{hit[0]} is a blind order: {hit[1]} is withheld"
+                searcher = name in ("rg", "grep", "egrep", "fgrep") or \
+                    (name == "git" and file_args[:1] == ["grep"])
+                if searcher:
+                    dirs = [self.resolve(a, cur) for a in file_args if (cur / a).is_dir()
+                            or Path(os.path.expanduser(a)).is_dir()] or [cur]
+                    for d in dirs:
+                        why = self.blind_parent(d)
+                        if why:
+                            return why
+            why = self.check_program(name, prog, args, cur)
+            if why:
+                return why
+        return None
+
+    def strip_redirects(self, seg):
+        words, targets, i = [], [], 0
+        while i < len(seg):
+            t = seg[i]
+            if t in WRITE_REDIRECTS:
+                if words and words[-1].isdigit():
+                    words.pop()
+                if i + 1 < len(seg):
+                    tgt = seg[i + 1]
+                    if not (tgt.isdigit() or tgt == "-"):
+                        targets.append(tgt)
+                i += 2
+                continue
+            if t in READ_REDIRECTS:
+                if words and words[-1].isdigit():
+                    words.pop()
+                i += 2
+                continue
+            words.append(t)
+            i += 1
+        return words, targets
+
+    def program(self, seg, full=False):
+        """Find the program in a segment, past VAR=x prefixes and wrappers."""
+        i, env, wrappers = 0, [], []
+        assign = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+        while i < len(seg) and assign.match(seg[i]):
+            env.append(assign.match(seg[i]).group(1))
+            i += 1
+        while i < len(seg) and Path(seg[i]).name in WRAPPERS:
+            wrappers.append(Path(seg[i]).name)
+            i += 1
+            while i < len(seg) and (seg[i].startswith("-") or assign.match(seg[i])):
+                m = assign.match(seg[i])
+                if m:
+                    env.append(m.group(1))
+                i += 1
+        prog, args = (seg[i], seg[i + 1:]) if i < len(seg) else (None, [])
+        return (prog, args, env, wrappers) if full else (prog, args)
+
+    def outward_arg(self, args, cur: Path):
+        """An argument that points into the main checkout or control plane.
+
+        From inside a workspace, the only reason to name the main checkout is
+        to change it; the workspace holds its own copy of every file.
+        """
+        for a in args:
+            for cand in ([a] if not a.startswith("-") else []) + \
+                    ([a.split("=", 1)[1]] if "=" in a else []):
+                if "/" not in cand and not cand.startswith("~"):
+                    continue
+                if UNRESOLVED.search(cand):
+                    return f"argument {cand!r} cannot be resolved by the guard"
+                p = self.resolve(cand, cur)
+                if self.L and is_within(p, self.L.root):
+                    return (f"argument {cand} points into the main checkout; from a workspace, "
+                            "work on the workspace copy")
+                if self.protected_hit(p) or any(is_within(p, s) for s in self.secrets):
+                    return f"argument {cand} points at control-plane state or key material"
+        return None
+
+    def check_program(self, name, prog, args, cur: Path):
+        in_ws = self.ws_for(cur)
+        if name in ("sudo", "su", "doas"):
+            return f"{name} is denied: privilege escalation is outside every authority level"
+        if name in ("ssh-keygen", "ssh-add", "ssh-agent"):
+            return f"{name} is denied: agents never touch signing keys"
+        if name == "st" or prog.endswith("/st"):
+            pos = [a for a in args if not a.startswith("-")]
+            sub = pos[0] if pos else ""
+            if sub in SURGEON_CMDS:
+                return (f"`st {sub}` is surgeon-only. Ask the surgeon to run it in their own "
+                        "terminal; it is signed with their key.")
+            if self.role != "copilot" and sub not in SPECIALIST_ST_CMDS:
+                return (f"`st {sub}` belongs to the copilot; specialists may run "
+                        f"{', '.join(sorted(SPECIALIST_ST_CMDS))}")
+            if sub == "report" and self.role != "copilot" and len(pos) > 1:
+                if not any(o["id"] == pos[1] for o, *_ in self.active):
+                    return f"{pos[1]} is not an order dispatched to {self.role}"
+            if sub == "check" and len(pos) > 1:
+                # Checks are shell commands from the spec. Agents may trigger
+                # them only when the surgeon signed that exact spec; otherwise
+                # an agent could author a check and run it past the guard.
+                try:
+                    o = self.L.order(pos[1])
+                    ok, _ = verify(o.get("approval"), {"kind": "approve", "order": o["id"],
+                                                       "spec_sha": sha(o["spec"])})
+                except (StError, AttributeError):
+                    ok = False
+                if not ok:
+                    return (f"`st check {pos[1]}` needs a signed approval of the spec; under a "
+                            "standing order the surgeon runs the checks")
+            return None
+        if name == "git":
+            return self.check_git(args, cur)
+        inplace = any(re.match(r"^-[A-Za-z0-9]*i", a) or a.startswith("--in-place") for a in args)
+        if name in INPLACE_EDITORS and inplace:
+            why = self.outward_arg(args, cur)
+            if why:
+                return why
+        if name in FILE_MUTATORS or (name in INPLACE_EDITORS and inplace):
+            paths = [a for a in args if not a.startswith("-")]
+            if name in INPLACE_EDITORS:
+                paths = paths[1:]  # first word is the script
+            if not paths:
+                return None if in_ws else self.no_ws_msg(f"`{name}` in {cur}")
+            for a in paths:
+                if UNRESOLVED.search(a):
+                    return f"`{name}` argument {a!r} cannot be resolved by the guard"
+                why = self.check_write_path(self.resolve(a, cur), name)
+                if why:
+                    return why
+            return None
+        if name == "find" and any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir",
+                                        "-fprint", "-fprintf", "-fls") for a in args):
+            if not in_ws:
+                return self.no_ws_msg(f"`find -delete/-exec` in {cur}")
+            return self.outward_arg(args, cur)
+        if name in INTERPRETERS and INTERPRETERS[name] in args:
+            if not in_ws:
+                return self.no_ws_msg(f"inline `{name}` code in {cur}")
+            code = args[args.index(INTERPRETERS[name]) + 1:][:1]
+            return self.outward_arg(re.findall(r"""(?:~|\.\.|/)[^\s'"(),;]*""", code[0])
+                                    if code else [], cur)
+        if name == "eval":
+            return None if in_ws else self.no_ws_msg(f"`eval` in {cur}")
+        if name in ("curl", "wget"):
+            bad = {"-d", "--data", "--data-binary", "--data-raw", "--data-urlencode", "-F",
+                   "--form", "-T", "--upload-file", "--post-data", "--post-file"}
+            if any(a in bad or a.split("=")[0] in bad for a in args) or \
+                    any(a in ("-X", "--request") for a in args):
+                return f"{name} with an upload or custom method is denied: it can send project data out"
+            return None
+        if name in ("scp", "sftp", "nc", "ncat", "socat"):
+            return f"{name} is denied: outbound transfer"
+        if name in ("brew", "gem") or (name == "cargo" and args[:1] == ["install"]) or \
+                (name == "go" and args[:1] in (["install"], ["get"])) or \
+                (name in ("npm", "pnpm", "yarn") and any(a in ("-g", "--global") for a in args)) or \
+                (name in ("pip", "pip3") and "--user" in args):
+            return f"`{name} {' '.join(args[:1])}` changes global state, which is L3"
+        pkg_mut = {"npm": {"install", "i", "add", "ci", "uninstall", "remove", "update"},
+                   "pnpm": {"install", "i", "add", "remove", "update"},
+                   "yarn": {"install", "add", "remove", "upgrade"},
+                   "cargo": {"add", "remove", "update"},
+                   "pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"},
+                   "uv": {"add", "remove", "pip", "sync"}, "poetry": {"add", "remove", "install"}}
+        if name in pkg_mut and args[:1] and args[0] in pkg_mut[name]:
+            return None if in_ws else self.no_ws_msg(f"`{name} {args[0]}` in {cur}")
+        if name in READONLY_PROGS:
+            return None
+        if in_ws:
+            return self.outward_arg(args, cur)
+        return self.no_ws_msg(
+            f"`{name}` in {cur} (outside a workspace only read-only viewers, git reads, "
+            "and st run; builds and tests run in a workspace)")
+
+    def check_git(self, args, cur: Path):
+        gcwd, i = cur, 0
+        while i < len(args) and args[i].startswith("-"):
+            a = args[i]
+            if a == "-C" and i + 1 < len(args):
+                gcwd = self.resolve(args[i + 1], gcwd)
+                i += 2
+                continue
+            if a.startswith(("--git-dir", "--work-tree")):
+                return "git --git-dir/--work-tree is denied; use the order's workspace"
+            if a == "-c" and i + 1 < len(args):
+                i += 2
+                continue
+            i += 1
+        if i >= len(args):
+            return None
+        sub, rest = args[i], args[i + 1:]
+        entry = self.ws_for(gcwd)
+        if sub in GIT_READ:
+            return None
+        if sub == "branch":
+            if any(a in ("-d", "-D", "--delete", "-m", "-M", "--move", "-f", "--force",
+                         "-c", "-C", "--copy") for a in rest):
+                return "deleting, moving, or forcing branches is L3"
+            if [a for a in rest if not a.startswith("-")] and \
+                    not any(a in ("-l", "--list", "-a", "-r", "--contains", "--merged") for a in rest):
+                return "creating branches is done by `st dispatch`"
+            return None
+        if sub == "tag":
+            return None if (not rest or rest[0] in ("-l", "--list")) else "tagging is L3"
+        if sub == "remote":
+            return None if (not rest or rest[0] in ("-v", "show", "get-url")) else \
+                "changing remotes is L3"
+        if sub == "config":
+            if any(a in ("--global", "--system") for a in rest):
+                return "global git config is L3"
+            return None if any(a.startswith(("--get", "--list", "-l")) for a in rest) else \
+                "changing git config is outside every order"
+        if sub == "worktree":
+            return None if rest[:1] == ["list"] else "worktrees are managed by `st dispatch`"
+        if sub == "stash" and rest[:1] == ["list"]:
+            return None
+        if sub == "reset":
+            if "--hard" in rest:
+                return "git reset --hard is L3"
+            return None if entry else self.no_ws_msg(f"git reset in {gcwd}")
+        if sub == "clean":
+            return "git clean is L3"
+        if sub == "reflog":
+            return None if not rest or rest[0] == "show" else "rewriting the reflog is L3"
+        if sub in GIT_ALWAYS_DENY:
+            return f"git {sub} is L3 (it rewrites or integrates history)"
+        if entry and sub not in GIT_READ:
+            why = self.outward_arg(rest, gcwd)
+            if why:
+                return why
+        if sub in GIT_WORKTREE_OPS:
+            if sub in ("checkout", "switch") and any(a in ("-b", "-B", "-c", "-C", "--orphan")
+                                                     for a in rest):
+                return "creating branches is done by `st dispatch`"
+            return None if entry else self.no_ws_msg(f"git {sub} in {gcwd}")
+        if sub in GIT_HISTORY_OPS:
+            if not entry:
+                return self.no_ws_msg(f"git {sub} in {gcwd}")
+            if entry[1] < 2:
+                return f"git {sub} needs L2; {entry[0]['id']} is L{entry[1]}"
+            return None
+        if sub == "push":
+            return self.check_push(rest, gcwd, entry)
+        return f"git {sub} is not on the guard's allowlist; report the need"
+
+    def check_push(self, rest, gcwd, entry):
+        if not entry:
+            return self.no_ws_msg(f"git push from {gcwd}")
+        o, level, push, _ = entry
+        if level < 2 or not push:
+            return f"{o['id']} does not permit a push; commit locally and report the branch ready"
+        for a in rest:
+            if a in ("-f", "--force", "--mirror", "--all", "--tags", "-d", "--delete",
+                     "--prune") or a.startswith(("--force", "--mirror")):
+                return f"git push {a} is L3"
+        pos = [a for a in rest if not a.startswith("-")]
+        remotes = set(git(["remote"], self.L.root, check=False).split())
+        branch = o["dispatch"]["branch"] if o.get("dispatch") else f"st/{o['id']}"
+        expected = f"st/{o['id']}-"
+        if pos:
+            if pos[0] not in remotes:
+                return f"push target {pos[0]!r} is not a configured remote; other destinations are L3"
+            for ref in pos[1:]:
+                if ref.startswith("+") or ":" in ref or not ref.startswith(expected):
+                    return f"push may only send the order's own branch ({branch})"
+        return None
+
+
+def normalize_tool(name) -> str:
+    n = str(name or "").strip()
+    if n.startswith("@builtin/"):
+        n = n[len("@builtin/"):]
+    return TOOL_ALIASES.get(n, TOOL_ALIASES.get(n.lower(), n.lower()))
+
+
+def guard_decide(role: str, ev: dict) -> str | None:
+    raw = ev.get("tool_name", "")
+    tool = normalize_tool(raw)
+    inp = ev.get("tool_input") or {}
+    cwd = Path(ev.get("cwd") or os.getcwd())
+    if tool not in KNOWN_TOOLS:
+        # Fail closed: a tool the guard does not understand may write.
+        return (f"tool {raw!r} is not one the guard understands, so it is denied; the team "
+                f"agents use {', '.join(sorted(KNOWN_TOOLS))}")
+    g = Guard(role, cwd)
+    if tool == "code" and inp.get("operation") in CODE_WRITE_OPS and \
+            inp.get("dry_run") is not True:
+        target = inp.get("file_path") or inp.get("path") or str(g.cwd)
+        return g.check_write_path(g.resolve(target, g.cwd), f"code {inp.get('operation')}")
+    if tool in ("read", "grep", "glob", "code"):
+        return g.check_read(inp, tool)
+    if tool == "write":
+        paths = [inp.get(k) for k in ("path", "file_path", "filePath") if inp.get(k)]
+        if not paths:
+            return "write without a path"
+        for p in paths:
+            why = g.check_write_path(g.resolve(p, g.cwd))
+            if why:
+                return why
+        return None
+    if tool == "shell":
+        wd = inp.get("working_dir")
+        return g.check_shell(str(inp.get("command", "")), g.resolve(wd, g.cwd) if wd else g.cwd)
+    if tool == "subagent":
+        if role != "copilot":
+            return "only the copilot dispatches subagents"
+        return g.check_subagent(inp)
+    return None  # web_search, web_fetch, todo_list, summary: no local side effects
+
+
+def cmd_guard(args):
+    try:
+        ev = json.loads(sys.stdin.read() or "{}")
+        why = guard_decide(args.role, ev)
+    except Exception as e:  # fail closed
+        why = f"guard error, failing closed: {type(e).__name__}: {e}"
+    if why:
+        print(f"surgical-team guard: BLOCKED. {why}", file=sys.stderr)
+        return 2
+    return 0
+
+
+# --- agent configs -----------------------------------------------------------
+
+ROLE_TOOLS = {
+    "copilot": ["read", "glob", "grep", "code", "shell", "write", "subagent",
+                "todo_list", "web_search", "web_fetch"],
+    "_specialist": ["read", "glob", "grep", "code", "shell", "write",
+                    "web_search", "web_fetch"],
+}
+ROLE_DESCRIPTIONS = {
+    "copilot": "Surgical team copilot: the surgeon's design partner and the only dispatcher",
+    "editor": "Surgical team editor: finishes the surgeon's documents",
+    "toolsmith": "Surgical team toolsmith: dev environment, scripts, CI, agent tooling",
+    "tester": "Surgical team tester: adversarial tests from the spec",
+}
+
+
+def agent_config(role: str, team_root: Path) -> dict:
+    st = str(team_root / "bin" / "st")
+    skills = team_root / "skills"
+    specialist = role != "copilot"
+    prompt = (
+        f"You are the surgical team's {role}. The surgeon is the human; you serve them. "
+        f"Follow the protocol and your role skill, both loaded as context. The control "
+        f"plane is `{st}` (also `st` if on PATH). A preToolUse guard enforces your "
+        f"authority from the ledger. A blocked call is outside your order: never try to "
+        f"get the same effect another way. Continue with the work that is within the "
+        f"order, and quote the block in your report.")
+    if specialist:
+        prompt += (" You were dispatched with a briefing naming exactly one work order. "
+                   "Work only in its workspace, and finish by filing `st report <WO>` and "
+                   "returning the same report as your summary.")
+    else:
+        prompt += (" You are the only agent that dispatches. Specialists run only as "
+                   f"{AGENT_PREFIX}<role> subagents carrying an `st dispatch` briefing.")
+    cfg = {
+        "name": f"{AGENT_PREFIX}{role}",
+        "description": ROLE_DESCRIPTIONS.get(role, f"Surgical team {role}: language specialist"),
+        "prompt": prompt,
+        "tools": ROLE_TOOLS["_specialist" if specialist else "copilot"],
+        # Read tools are auto-approved everywhere. Specialists also run write
+        # and shell without prompts: they are subagents with no one to answer
+        # a prompt, and the guard, not a prompt, is the control.
+        "allowedTools": ["read", "glob", "grep", "code"] + (["write", "shell"] if specialist else []),
+        "toolsSettings": {"shell": {"allowedCommands": [rf"{re.escape(st)} (status|list|show|brief|verify)\b.*",
+                                                         r"st (status|list|show|brief|verify)\b.*"],
+                                    "autoAllowReadonly": True}},
+        "resources": [f"file://{skills / 'surgical-team-protocol' / 'SKILL.md'}",
+                      f"file://{skills / role / 'SKILL.md'}",
+                      f"skill://{skills / 'surgical-team-protocol' / 'references'}/*.md"],
+        "hooks": {"preToolUse": [{"matcher": "*", "command": f"{shlex.quote(st)} guard --role {role}",
+                                  "timeout_ms": 15000}]},
+    }
+    if not specialist:
+        cfg["toolsSettings"]["crew"] = {"availableAgents": [f"{AGENT_PREFIX}*"]}
+        cfg["hooks"]["agentSpawn"] = [{"command": f"{shlex.quote(st)} status 2>&1 || true"}]
+    return cfg
+
+
+def team_roles(team_root: Path) -> list[str]:
+    roles = []
+    for d in sorted((team_root / "skills").iterdir()):
+        if (d / "SKILL.md").exists() and ROLE_RE.match(d.name):
+            roles.append(d.name)
+    return roles
+
+
+def cmd_install(args):
+    team_root = Path(__file__).resolve().parent.parent
+    dest = Path(args.dir).expanduser() if args.dir else Path.home() / ".kiro" / "agents"
+    dest.mkdir(parents=True, exist_ok=True)
+    for role in team_roles(team_root):
+        cfg = agent_config(role, team_root)
+        f = dest / f"{cfg['name']}.json"
+        f.write_text(json.dumps(cfg, indent=2) + "\n")
+        print(f"wrote {f}")
+    print(f"start a session with: kiro-cli chat --agent {AGENT_PREFIX}copilot")
+
+
+# --- cli ---------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="st", description="Surgical team control plane")
+    p.add_argument("--version", action="version", version=f"st {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_):
+        sp = sub.add_parser(name, help=help_)
+        sp.set_defaults(fn=fn)
+        return sp
+
+    sp = add("draft", cmd_draft, "file a new order from JSON on stdin")
+    sp.add_argument("--file")
+    sp = add("revise", cmd_revise, "replace an order's spec; returns it to drafted")
+    sp.add_argument("order"); sp.add_argument("--file"); sp.add_argument("--note")
+    sp = add("dispatch", cmd_dispatch, "dispatch an approved order; prints the briefing")
+    sp.add_argument("order"); sp.add_argument("--allow-overlap", action="store_true")
+    sp = add("brief", cmd_brief, "print an order's briefing")
+    sp.add_argument("order")
+    sp = add("report", cmd_report, "file the report for the current attempt (JSON on stdin)")
+    sp.add_argument("order"); sp.add_argument("--file")
+    sp = add("check", cmd_check, "run the order's executable acceptance checks")
+    sp.add_argument("order")
+    sp = add("reclaim", cmd_reclaim, "return a stuck dispatched order for re-dispatch")
+    sp.add_argument("order"); sp.add_argument("--reason", required=True)
+    add("journal", cmd_journal, "append a session journal entry (markdown on stdin)")
+    sp = add("show", cmd_show, "show an order with its authority, report, checks")
+    sp.add_argument("order")
+    sp = add("list", cmd_list, "list orders")
+    sp.add_argument("--state")
+    add("status", cmd_status, "render STATUS.md and print it")
+    add("verify", cmd_verify, "verify every signature in the ledger")
+    sp = add("guard", cmd_guard, "Kiro preToolUse hook (reads the hook event on stdin)")
+    sp.add_argument("--role", required=True)
+
+    sp = add("setup", cmd_setup, "[surgeon] configure the signing key")
+    sp.add_argument("--key", required=True); sp.add_argument("--identity", required=True)
+    sp.add_argument("--allow-unencrypted", action="store_true",
+                    help="accept a key with no passphrase (test setups only)")
+    sp = add("init", cmd_init, "[surgeon] create the ledger in this repository")
+    sp.add_argument("--default-standing", action="store_true",
+                    help="also file a signed standing order: L0 work needs no approval")
+    sp = add("approve", cmd_approve, "[surgeon] approve a drafted order")
+    sp.add_argument("order"); sp.add_argument("--level", choices=sorted(LEVELS))
+    sp.add_argument("--push", action="store_true")
+    sp.add_argument("--for", dest="valid_for", type=int, metavar="MINUTES",
+                    help="how long the approval may be used (default max(60, 3x budget))")
+    for name, verdict in (("accept", "accepted"), ("reject", "rejected"), ("defer", "deferred")):
+        sp = add(name, lambda a, v=verdict: _verdict(a, v), f"[surgeon] {name} reported orders")
+        sp.add_argument("orders", nargs="+"); sp.add_argument("-m", "--message")
+    sp = add("cancel", cmd_cancel, "[surgeon] cancel an order")
+    sp.add_argument("order"); sp.add_argument("-m", "--message")
+    sp = add("decide", cmd_decide, "[surgeon] record a decision")
+    sp.add_argument("--title", required=True); sp.add_argument("--decision", required=True)
+    sp.add_argument("--why"); sp.add_argument("--consequence", action="append")
+    sp.add_argument("--rejected", action="append"); sp.add_argument("--scope")
+    sp.add_argument("--context"); sp.add_argument("--supersedes"); sp.add_argument("--expires")
+    sp = add("grant", cmd_grant, "[surgeon] issue a standing order")
+    sp.add_argument("--role", required=True); sp.add_argument("--max", required=True)
+    sp.add_argument("--scope", required=True); sp.add_argument("--budget", type=int, default=30)
+    sp.add_argument("--expires")
+    sp = add("revoke", cmd_revoke, "[surgeon] revoke a decision or standing order")
+    sp.add_argument("decision"); sp.add_argument("-m", "--message")
+    sp = add("install", cmd_install, "[surgeon] write guarded st-<role> Kiro agent configs")
+    sp.add_argument("--dir", help="destination (default ~/.kiro/agents)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        rc = args.fn(args)
+    except StError as e:
+        print(f"st: {e}", file=sys.stderr)
+        return 1
+    return rc or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

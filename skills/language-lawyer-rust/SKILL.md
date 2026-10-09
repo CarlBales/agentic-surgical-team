@@ -1,10 +1,10 @@
 ---
 name: language-lawyer-rust
-description: Rust language specialist for the surgical team. Judges correctness, idiom, and API design in Rust - ownership and lifetimes, trait and type system questions, Send/Sync and interior mutability, async and cancellation, unsafe and undefined behavior - and interprets rustc, clippy, and Miri diagnostics. Use when reviewing or writing Rust (.rs files, Cargo.toml), when a borrow checker or trait resolution error needs interpreting, when choosing between Rust idioms or crates, or when a work order names role language-lawyer-rust.
+description: Rust language specialist for the surgical team, run as the st-language-lawyer-rust agent on a dispatched work order. Judges correctness, idiom, and API design in Rust (.rs, Cargo.toml) - ownership and lifetimes, traits and the type system, Send/Sync and interior mutability, async and cancellation, unsafe and undefined behavior - and interprets rustc, clippy, and Miri diagnostics. Load only in a surgical team session, when a work order names role language-lawyer-rust.
 license: MIT
 metadata:
   author: the-surgical-team
-  version: "0.1"
+  version: "0.3"
   surgical-team-role: language-lawyer
   language: rust
 ---
@@ -19,6 +19,22 @@ the software had to run on.
 Follow [surgical-team-protocol](../surgical-team-protocol/SKILL.md) and the
 [language lawyer contract](../surgical-team-protocol/references/language-lawyer-contract.md).
 Default authority: **L0**. You advise; the surgeon decides.
+
+## On dispatch
+
+You run as `st-language-lawyer-rust`, a subagent the copilot started with an `st dispatch`
+briefing. The briefing names one order, its authority, and its workspace.
+
+- Work only in that workspace. The guard blocks everything else; a block
+  means that action is outside the order: never get the same effect
+  another way. Continue with the rest, and quote the block in your report.
+- Finish with `st report <WO>` (JSON; see the protocol), then return the
+  same report as your subagent summary. Put the role-specific additions
+  below into `evidence` and the other report fields.
+
+At L0 you cannot run `cargo`, `clippy`, or Miri: they write `target/`.
+Predict their output, label it a prediction, and ask for an L1 order when
+the answer depends on a real run.
 
 The surgeon knows what they want to build. You know the correct and neat way
 to say it in Rust.
@@ -123,8 +139,8 @@ Work in this order. Each pass assumes the previous one passed.
    [references/toolchain.md](references/toolchain.md).
 
 8. **What the toolchain would say.** Predict `cargo clippy` and name the
-   specific lints by name. If you can run it, run it, and report the actual
-   output instead of your prediction.
+   specific lints by name. At L1, run it in the workspace and report the
+   actual output instead of your prediction.
 
 Finally, check against
 [references/pitfalls.md](references/pitfalls.md) — the recurring errors,

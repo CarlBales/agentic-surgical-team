@@ -88,7 +88,7 @@ Every implementation must:
    you cannot verify without running it, say so and say what to run. Never
    invent an API, a flag, or a lint name.
 7. **Be interchangeable.** Produce the same report shape regardless of
-   language, so the clerk can file it and the surgeon can read it without
+   language, so `st` can file it and the surgeon can read it without
    relearning the format.
 
 ## Report shape
@@ -134,4 +134,6 @@ the surgeon's context on every consultation.
 - [ ] Toolchain reference covers build, test, lint, format, dependencies
 - [ ] Pitfalls reference covers common AI-generated mistakes in the language
 - [ ] Protocol skill referenced; default authority stated as L0
-- [ ] `skills-ref validate` passes
+- [ ] `description` says to load only in a surgical team session
+- [ ] `scripts/validate-skills.sh` passes
+- [ ] `st install` regenerated, so `st-language-lawyer-<lang>` exists

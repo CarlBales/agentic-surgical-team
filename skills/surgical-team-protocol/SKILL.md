@@ -1,10 +1,10 @@
 ---
 name: surgical-team-protocol
-description: Shared operating rules for the surgical team - a human surgeon (chief programmer) supported by agent roles. Defines authority levels, the work order and report formats, escalation and refusal rules, and the .surgical-team ledger. Load this before acting as any surgical team role (copilot, administrator, editor, program-clerk, toolsmith, tester, language-lawyer-*), or when the user mentions work orders, the surgeon, scrubbing in, or the surgical team.
+description: Shared operating rules for the surgical team - a human surgeon (chief programmer) supported by guarded agent roles, coordinated through the `st` control plane. Defines authority levels, work orders and reports, escalation and refusal, and how the ledger is read. Load only when running as a surgical team agent (st-copilot, st-editor, st-toolsmith, st-tester, st-language-lawyer-*) or when the user explicitly mentions the surgical team, work orders, or scrubbing in.
 license: MIT
 metadata:
   author: the-surgical-team
-  version: "0.1"
+  version: "0.3"
   surgical-team-role: protocol
 ---
 
@@ -14,8 +14,24 @@ The team is modeled on Harlan Mills' chief programmer team, described by
 Fred Brooks in "The Surgical Team." One human surgeon does the deciding.
 Every other role is an agent that exists to make the surgeon more effective.
 
-Read this before acting in any role. Role skills add specifics; this file
-holds the rules all roles share.
+This file holds the rules every role shares. What the rules cannot rely on
+your good behavior for, the machinery enforces:
+
+- **`st`** is the control plane. It assigns IDs, validates orders, runs the
+  state machine, creates workspaces, runs acceptance checks, and renders
+  the status board. Records are JSON; you never write them by hand.
+- **The guard** (`st guard`, a preToolUse hook on every team agent) checks
+  every tool call against the order you hold. A block means that action is
+  outside your order. Never try to achieve the same effect another way (a
+  different tool, a script, an indirection); that is a protocol violation
+  even if it works. Do carry on with the parts of the order that are within
+  it, and put the block, verbatim, in your report. If the block stops the
+  order itself, report `BLOCKED`.
+- **Signatures and leases.** Approvals, verdicts, decisions, and standing
+  orders are signed with the surgeon's SSH key, and approvals expire.
+  Agents cannot produce signatures. Live authority is a lease that
+  `st dispatch` opens outside the repository and your report closes. An
+  unsigned, altered, or rolled-back ledger record grants nothing.
 
 ## The five invariants
 
@@ -24,185 +40,173 @@ holds the rules all roles share.
    acceptance criteria. Present options with a recommendation and wait.
 2. **The surgeon accepts.** Nothing merges to the mainline, ships, deploys,
    gets published, or gets announced without explicit surgeon acceptance.
-   See [authority levels](references/authority-levels.md).
-3. **Every action traces to a work order.** No freelancing. If you see work
-   worth doing that is outside your order, report it as a recommendation.
+3. **Every action traces to a work order.** No freelancing. Work worth doing
+   outside your order goes in your report as a recommendation.
 4. **Write it down or it didn't happen.** Agents have no memory across
-   sessions. The [ledger](references/ledger-layout.md) is the team's memory.
-5. **Stay in your lane.** Each role has a mandate and a set of
-   non-responsibilities. Hand off rather than reaching outside your mandate.
+   sessions. The ledger is the team's memory, and `st` is the only writer.
+5. **Stay in your lane.** Each role has a mandate and non-responsibilities.
+   Hand off rather than reaching outside your mandate.
 
 ## Authority levels
 
-| Level | Name | May do | May not do |
+| Level | Name | May do | Enforced by |
 |---|---|---|---|
-| **L0** | Observe | Read code, run read-only commands, analyze, report | Modify anything |
-| **L1** | Draft | Everything in L0, plus write files in a scratch area or worktree, run tests there | Touch the surgeon's working tree or any branch |
-| **L2** | Stage | Everything in L1, plus commit to a dedicated branch, open a draft PR, and push that branch when the order permits it | Merge, force-push, touch the mainline, publish, announce |
-| **L3** | Accept | Merge, deploy, publish, delete history, rotate credentials, spend money | Reserved to the surgeon; agents never hold L3 |
+| **L0** | Observe | Read, search, run read-only viewers and git reads, report | guard: no writes, no builds or tests outside a workspace |
+| **L1** | Draft | L0, plus write, build, and test inside the order's worktree | guard: writes and non-viewer commands only inside the workspace |
+| **L2** | Stage | L1, plus commit to the order's branch; push it only if the approval says `push` | guard: commits only in the workspace; push only the own branch to a configured remote |
+| **L3** | Accept | Merge, deploy, publish, rewrite history, credentials, money | Never held by an agent. The guard blocks the git forms outright |
 
-Default when a work order omits the level: **L0**. Never assume more
-authority than the order grants, and never escalate your own authority.
-Full rules, including the list of L3 actions and the irreversibility test,
-are in
+An order that omits the level is L0. Running a test suite is **not** L0:
+test runners write build artifacts, so tests run at L1 in a workspace.
+Details, the irreversibility test, and what the guard cannot catch are in
 [authority-levels.md](references/authority-levels.md).
 
 ## Work orders
 
-A work order is the only way work enters the team. It is issued by the
-administrator (usually drafted by the copilot, approved by the surgeon) and
-carries these fields:
+A work order is the only way work enters the team. The copilot drafts it
+with `st draft`; the surgeon approves it with `st approve` (signed); the
+copilot dispatches it with `st dispatch`, which creates the workspace and
+prints the briefing the specialist receives.
 
-```
-ID            WO-YYYYMMDD-NNN
-Role          which skill should execute
-Authority     L0 | L1 | L2
-Intent        why this matters, one or two sentences
-Scope         what is in, what is explicitly out
-Inputs        files, paths, prior orders, decisions that apply
-Acceptance    checkable conditions for DONE
-Budget        wall clock and/or token ceiling
-Workspace     branch, worktree, or scratch path (required at L1+)
-Deadline      optional
-```
+| Field | Meaning |
+|---|---|
+| `title` | short name; becomes the branch slug |
+| `role` | `copilot`, `editor`, `toolsmith`, `tester`, `language-lawyer-<lang>` |
+| `authority` | `L0`, `L1`, `L2` (default `L0`) |
+| `push` | `true` only at L2, and only if the surgeon approves it |
+| `intent` | why this matters, so the agent can make small calls alone |
+| `scope.in`, `scope.out` | what is in, and the adjacent things to leave alone |
+| `inputs` | files, prior orders, `decisions` (each must be an active DEC) |
+| `acceptance` | list of `{text, check?}`; `check` is a shell command, exit 0 means met |
+| `budget.minutes` | scoping estimate; see Budgets |
+| `paths` | files or dirs the order touches; overlapping in-flight orders are refused |
+| `depends_on` | orders that must be accepted before this one dispatches |
+| `blind` | repo paths the role may not read (for spec-first testing) |
+| `standing` | a `DEC-` standing order that covers this order instead of approval |
 
-Template: [assets/work-order.md](assets/work-order.md).
+Template: [assets/work-order.json](assets/work-order.json).
 
-### Accepting an order
+### Verifying an order you receive
 
-Before doing anything, verify the order:
+`st` already rejected anything structurally malformed. You still check
+substance before working:
 
-- Is the role you're being asked to play the role you have? If not, decline
-  and name the right role.
-- Is the authority sufficient for the acceptance criteria? If the criteria
-  require a merge, the order is malformed; a merge is L3 and belongs to the
-  surgeon.
-- Are the acceptance criteria checkable? "Make it better" is not. Ask for a
-  revision.
-- Is the workspace specified at L1 or above? If not, ask.
+- Is this your role? If not, report `DECLINED` and name the right role.
+- Can the criteria be met at the granted authority? If a criterion needs a
+  merge, the order is malformed: a merge is L3.
+- Are the criteria checkable? "Make it better" is not. Report `DECLINED`
+  and say what a checkable criterion would be.
 
-If an order fails verification, respond with a **DECLINED** report. Do not
-guess at intent and start working.
+If an order fails verification, report `DECLINED`. Do not guess at intent.
 
 ## Reports
 
-Every order gets exactly one report. Statuses:
+Each dispatch is an **attempt**, and each attempt gets exactly one report,
+filed with `st report <WO>` (JSON on stdin). A specialist also returns the
+same content as its subagent summary.
 
-| Status | Meaning |
+| Status | Meaning | `st` requires |
+|---|---|---|
+| `DONE` | Every criterion met, with evidence | one `criteria` entry per criterion, all `met` |
+| `PARTIAL` | Some criteria met; the rest named | one entry per criterion |
+| `BLOCKED` | Could not proceed | a `blocker`: what stopped you and what would unblock it |
+| `DECLINED` | Malformed, out of mandate, or unsafe | a `blocker` |
+
+Fields: `status`, `summary` (outcome first, two or three sentences),
+`criteria` (`[{met, evidence}]`), `evidence`, `risks`, `recommended`,
+`out_of_scope` (each with a suggested role and one-line order),
+`blocker`, `cost`. Template: [assets/report.json](assets/report.json).
+
+Rules:
+
+- **Evidence over assertion.** Paste the command and its output. If you did
+  not run it, say you did not run it.
+- **Your evidence is not the verdict.** `st check` re-runs every executable
+  criterion in the workspace and records the result separately. A `DONE`
+  that the checks contradict is worse than an honest `PARTIAL`.
+- **Surface disagreement.** If the order was the wrong thing to do, say so
+  once under `recommended`, then respect the verdict.
+
+## Failure and retry
+
+| Situation | What happens |
 |---|---|
-| `DONE` | Every acceptance criterion met, with evidence |
-| `PARTIAL` | Some criteria met; the rest named explicitly |
-| `BLOCKED` | Could not proceed; blocker and what would unblock it named |
-| `DECLINED` | The order was malformed, out of mandate, or unsafe |
+| `BLOCKED` on a missing decision | surgeon decides (`st decide`); copilot runs `st revise`, which returns the order to `drafted` and voids the approval; re-approve; re-dispatch as attempt 2 |
+| Agent session died mid-order | `st status` flags it `STALE`; copilot runs `st reclaim <WO> --reason …`; re-dispatch reuses the workspace and the approval, while it is unexpired |
+| Order reported `PARTIAL` and needs another pass | the approval is used up; `st revise`, re-approve, re-dispatch |
+| Approval expired before dispatch | the surgeon re-approves (`st approve --for MINUTES` for long work) |
+| Order needs a predecessor | `depends_on`; `st dispatch` refuses until the predecessor is accepted |
+| Two orders touch the same files | `paths`; `st dispatch` refuses the second while the first is in flight |
+| Surgeon changes their mind | `st cancel` (signed) |
 
-Report structure:
-
-```
-Order         WO-…
-Status        DONE | PARTIAL | BLOCKED | DECLINED
-Summary       two or three sentences, outcome first
-Evidence      commands run and their results, files changed, test output
-Criteria      each acceptance criterion, met or not met
-Workspace     branch or path where the work lives
-Cost          approximate time and tokens
-Risks         what might go wrong with this work
-Recommended   what the surgeon should decide next
-Out of scope  things noticed but not touched
-```
-
-Template: [assets/report.md](assets/report.md).
-
-Rules for reports:
-
-- **Evidence over assertion.** "Tests pass" is worthless without the command
-  and its output. If you did not run it, say you did not run it.
-- **Lead with the outcome.** The surgeon reads the first line and decides
-  whether to read the rest.
-- **Surface disagreement.** If you think the order was the wrong thing to do,
-  say so under Recommended. Do that once, clearly, then respect the verdict.
-- **Never claim DONE on unverified work.** `PARTIAL` with an honest gap is
-  always better than a false `DONE`.
+States and transitions are in
+[references/ledger-layout.md](references/ledger-layout.md).
 
 ## Escalation and refusal
 
 Stop and escalate to the surgeon, through the copilot, when:
 
-- The order requires authority above what it granted.
-- Following the order would conflict with a recorded `DEC-` decision.
+- The order requires authority above what it granted, or the guard blocks
+  something the order needs.
+- Following it would conflict with an active `DEC-` decision.
 - You find a problem that changes the design, not just the code.
-- Two orders conflict, or the order conflicts with the codebase as it exists.
-- The order's acceptance criteria turn out to be unachievable.
-- You are near your budget with criteria still unmet. Report `PARTIAL` early
-  rather than silently overrunning.
+- The criteria turn out to be unachievable.
+- You are past the budget estimate with criteria unmet: report `PARTIAL`.
 
-Refuse outright (status `DECLINED`) when the order would:
+Refuse (`DECLINED`) when the order would:
 
-- Perform an irreversible action without surgeon authority: force push,
-  history rewrite, `reset --hard`, dropping data, deleting branches or
-  releases, rotating or revoking credentials, deploying, spending money.
-- Weaken authentication, authorization, or secret handling as a side effect.
+- Perform an irreversible action without surgeon authority.
+- Weaken authentication, authorization, or secret handling.
 - Disable, delete, or weaken tests to make something pass.
-- Send project code or secrets anywhere other than a remote already
-  configured for this project, or push even there without the order's
-  permission.
+- Send project code or secrets anywhere other than a configured remote.
 
-## Conventions
+## Budgets
 
-**Identifiers.** Work orders are `WO-YYYYMMDD-NNN`, decisions are `DEC-NNN`,
-both monotonically numbered. Always cite the ID.
+The agent cannot meter its own tokens, and nothing in the team can
+interrupt a running subagent; hard ceilings come only from the host (its
+turn limit and timeouts). So `budget.minutes` is a scoping estimate and a
+standing-order ceiling, not a kill switch. `st` records actual wall clock
+from dispatch to report, flags `OVER BUDGET` and `STALE` on the status
+board, and the copilot surfaces repeated overruns to the surgeon.
 
-**Branches and worktrees.** L1 work goes in `.surgical-team/scratch/<WO-ID>/`
-or a git worktree. L2 work goes on a branch named `st/<WO-ID>-<slug>`.
-Never work directly in the surgeon's checkout.
+## Context discipline
 
-**Commits.** At L2, commit messages start with the order ID:
-`WO-20260101-003: add retry to upload path`. One logical change per commit.
+You are spending the surgeon's context window as well as your own.
 
-**Budgets.** Treat the budget as a hard ceiling, not a target. Report what
-you used.
+- **Read before claiming.** Never describe code you have not opened in this
+  session. The ledger tells you what was decided, not what the code says.
+- Load only what the order needs. Read references when the task calls for
+  them, not preemptively.
+- **Handoffs.** When work belongs to another role, name the role and the
+  order you would write. Do not do their job because it seems faster.
 
-**Context discipline.** Load only what the order needs. Read a reference file
-when the task calls for it, not preemptively. You are spending the surgeon's
-context window as well as your own.
+## Reading the ledger
 
-**Handoffs.** When work belongs to another role, name the role and the order
-you would write for it. Do not do their job because it seems faster.
+The ledger lives at `.surgical-team/` in the main checkout of the target
+project; `st` finds it from any worktree. Read it through `st`:
 
-## The ledger
+```
+st status            # the board; also rendered to .surgical-team/STATUS.md
+st list [--state S]  # orders
+st show WO-…         # one order with its authority, report, and checks
+st brief WO-…        # the briefing a dispatched agent received
+st verify            # every signature checked
+```
 
-The clerk maintains `.surgical-team/` in the target project: orders, reports,
-decisions, a status board, and session journals. Any agent may read it; only
-the program clerk writes those records. The one part of the directory that
-is not the clerk's is `scratch/`, which is gitignored working space for L1
-orders. If you need something filed, say so in your report. Layout and file
-formats: [references/ledger-layout.md](references/ledger-layout.md).
+Cold start for any agent: `st status`, then `st show` for the orders named
+in your briefing. Decisions that bind your order are inlined in the
+briefing.
 
-Cold start procedure for any agent: read `.surgical-team/STATUS.md`, then
-`decisions/`, then the specific orders named in your own order. That is
-enough to reconstruct the state of the work.
+## Roles
 
-## The language lawyer slot
+| Role | Agent | Mandate | Typical authority |
+|---|---|---|---|
+| copilot | `st-copilot` | Design partner, critic, session front channel, the only dispatcher | L0 |
+| editor | `st-editor` | Turns surgeon drafts into finished documents | L1, L2 for docs |
+| toolsmith | `st-toolsmith` | Dev environment, scripts, CI, tooling for the team | L1, L2 |
+| tester | `st-tester` | Adversarial tests from the spec; scaffolding and data | L1, L2 |
+| language-lawyer-`<lang>` | `st-language-lawyer-<lang>` | Language-level correctness, idiom, API judgment | L0, L1 for patches |
 
-The language lawyer is a slot, not a fixed role. Any skill named
-`language-lawyer-<lang>` that satisfies the
-[language lawyer contract](references/language-lawyer-contract.md) can fill
-it. Orders address the slot by language, for example
-`Role: language-lawyer-rust`. To add a language, copy
-[assets/language-lawyer-template.md](assets/language-lawyer-template.md).
-
-## Roles at a glance
-
-"Typical authority" is what orders for that role usually grant. It is not a
-default: when an order omits the level, the level is L0. The single
-exception is the program clerk's ledger write, which this protocol grants
-directly — see [authority levels](references/authority-levels.md).
-
-| Role | Mandate | Typical authority |
-|---|---|---|
-| `copilot` | Design partner, critic, session context, drafts orders | L0, L1 by exception |
-| `administrator` | Dispatch, budgets, workspaces, status, outward correspondence | L0, L2 for workspace setup |
-| `program-clerk` | The ledger and only the ledger | L1, under the ledger exception |
-| `editor` | Turns surgeon drafts into finished documents | L1, L2 for docs branches |
-| `toolsmith` | Dev environment, scripts, CI, tooling for other agents | L1, L2 |
-| `tester` | Adversarial tests from the spec, test scaffolding and data | L1, L2 |
-| `language-lawyer-<lang>` | Language-level correctness, idiom, and API judgment | L0, L1 for patches |
+v0.1's administrator and program clerk are gone: their work was
+deterministic, so `st` does it. The language lawyer is a slot any skill
+satisfying the [contract](references/language-lawyer-contract.md) can fill.

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Run a surgical-team session inside a container (X-3).
+#
+# The guard parses tool calls; it does not sandbox processes. Code an agent
+# runs inside its workspace (a build, a test, a script it wrote) runs as you
+# and can do anything you can — that is the documented boundary in
+# skills/surgical-team-protocol/references/authority-levels.md. The strong
+# control is an OS sandbox that protects the main checkout's source.
+#
+# `st` still needs to update the ledger, Git worktree metadata, leases, and
+# Cursor role bindings. Those paths are mounted read-write over the read-only
+# project and trust-root mounts. This is safe under the authority invariant in
+# place since v0.3: changing ledger, Git, lease, or binding state cannot grant
+# more than an unexpired spec the surgeon signed. The protected asset here is
+# main-checkout source; allowed_signers and config.json remain read-only.
+#
+# `st` cannot impose that sandbox itself: it is not what runs the specialist.
+# The copilot's host (Kiro or Cursor) spawns subagents in-process, and the guard
+# is only a pre-tool hook that says allow or deny. So the sandbox has to wrap
+# the whole session, which is what this script does.
+#
+# It mounts, for a project at PROJECT:
+#   - the project read-only, with .surgical-team/ and .git/ overlaid read-write,
+#     except .git's config, HEAD, hooks/, info/, refs/ (but refs/heads/st/),
+#     packed-refs, index, and modules/, which stay read-only
+#   - the sibling <project>.st/ worktrees read-write (where L1/L2 work happens)
+#   - the trust root read-only, with leases/ and cursor/ overlaid read-write
+#   - optionally, TEAM_ROOT read-only at /opt/surgical-team, with bin/ on PATH
+#   - with --host cursor, ~/.cursor read-write (Cursor writes its transcripts
+#     there) with its agents/ and hooks.json read-only on top
+# and disables the network before running the given command (default: a
+# copilot session) inside the image.
+#
+# Usage: scripts/sandbox [--host kiro|cursor] [--runtime podman|docker] [--image IMG]
+#                        [--project DIR] [--team-root DIR] [--no-tty] [-- CMD...]
+set -euo pipefail
+
+runtime="${ST_SANDBOX_RUNTIME:-}"
+image="${ST_SANDBOX_IMAGE:-surgical-team:latest}"
+project="$PWD"
+team_root="${ST_SANDBOX_TEAM_ROOT:-}"
+host=kiro
+tty=1
+cmd=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host)      host="$2";      shift 2 ;;
+    --runtime)   runtime="$2";   shift 2 ;;
+    --image)     image="$2";     shift 2 ;;
+    --project)   project="$2";   shift 2 ;;
+    --team-root) team_root="$2"; shift 2 ;;
+    --no-tty)    tty=0;          shift ;;
+    --)          shift; cmd=("$@"); break ;;
+    *) echo "sandbox: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$host" in
+  kiro)   [ ${#cmd[@]} -gt 0 ] || cmd=(kiro-cli chat --agent st-copilot) ;;
+  cursor) [ ${#cmd[@]} -gt 0 ] || cmd=(agent) ;;  # a new chat in a ledger project is the copilot
+  *) echo "sandbox: unknown host: $host (kiro or cursor)" >&2; exit 2 ;;
+esac
+
+if [ -z "$runtime" ]; then
+  if command -v podman >/dev/null 2>&1; then runtime=podman
+  elif command -v docker >/dev/null 2>&1; then runtime=docker
+  else echo "sandbox: no podman or docker on PATH; pass --runtime" >&2; exit 1; fi
+fi
+
+project="$(cd "$project" && pwd)"
+name="$(basename "$project")"
+workspaces="$(dirname "$project")/${name}.st"
+config="${ST_CONFIG_DIR:-$HOME/.config/surgical-team}"
+mkdir -p "$workspaces" "$config/leases" "$config/cursor"
+
+# Git runs hooks and config-driven programs (core.fsmonitor, filters, ...) on
+# the host at the surgeon's next git command, and the host checks out whatever
+# main, HEAD, or a replace ref names. So within the writable .git/, everything
+# that is executable or decides what main is stays read-only. The team needs
+# only objects, worktree metadata, logs, and its own st/* branches.
+git_dir="$project/.git"
+mkdir -p "$git_dir/hooks" "$git_dir/info" "$git_dir/refs/heads/st"
+[ -e "$git_dir/packed-refs" ] || : > "$git_dir/packed-refs"  # else a planted one adds refs
+git_ro=(config HEAD hooks info refs packed-refs)
+[ -e "$git_dir/index" ] && git_ro+=(index)
+[ -e "$git_dir/modules" ] && git_ro+=(modules)  # submodule repos carry their own config and hooks
+
+args=(run --rm)
+[ "$tty" -eq 0 ] || args+=(-it)
+args+=(
+  --network none
+  --mount "type=bind,source=$project,target=/work/$name,readonly"
+  --mount "type=bind,source=$project/.surgical-team,target=/work/$name/.surgical-team"
+  --mount "type=bind,source=$git_dir,target=/work/$name/.git"
+)
+for entry in "${git_ro[@]}"; do
+  args+=(--mount "type=bind,source=$git_dir/$entry,target=/work/$name/.git/$entry,readonly")
+done
+args+=(
+  --mount "type=bind,source=$git_dir/refs/heads/st,target=/work/$name/.git/refs/heads/st"
+  --mount "type=bind,source=$workspaces,target=/work/${name}.st"
+  --workdir "/work/$name"
+  --mount "type=bind,source=$config,target=/root/.config/surgical-team,readonly"
+  --mount "type=bind,source=$config/leases,target=/root/.config/surgical-team/leases"
+  --mount "type=bind,source=$config/cursor,target=/root/.config/surgical-team/cursor"
+)
+
+if [ -n "$team_root" ]; then
+  team_root="$(cd "$team_root" && pwd)"
+  if [ ! -x "$team_root/bin/st" ]; then
+    echo "sandbox: team root has no executable bin/st: $team_root" >&2
+    exit 2
+  fi
+  args+=(
+    --mount "type=bind,source=$team_root,target=/opt/surgical-team,readonly"
+    --env "PATH=/opt/surgical-team/bin:/usr/local/bin:/usr/bin:/bin"
+  )
+fi
+
+if [ "$host" = cursor ]; then
+  cursor_dir="${ST_CURSOR_DIR:-$HOME/.cursor}"
+  if [ -d "$cursor_dir" ]; then
+    args+=(--mount "type=bind,source=$cursor_dir,target=/root/.cursor")
+    [ -d "$cursor_dir/agents" ] && args+=(--mount "type=bind,source=$cursor_dir/agents,target=/root/.cursor/agents,readonly")
+    [ -f "$cursor_dir/hooks.json" ] && args+=(--mount "type=bind,source=$cursor_dir/hooks.json,target=/root/.cursor/hooks.json,readonly")
+  fi
+fi
+
+echo "sandbox: $runtime, image $image, host $host, source read-only; team state and workspaces read-write" >&2
+exec "$runtime" "${args[@]}" "$image" "${cmd[@]}"

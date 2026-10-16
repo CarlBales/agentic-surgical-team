@@ -1,0 +1,210 @@
+{
+  "about": "An approved L0 security-reviewer order grants one AWS source and exact Kiro and Cursor MCP tools.",
+  "fixture": {
+    "orders": [
+      {
+        "as": "A",
+        "spec": {
+          "role": "security-reviewer",
+          "authority": "L0",
+          "inputs": {
+            "sources": [
+              {
+                "tool": "use_aws",
+                "service": "logs",
+                "operations": [
+                  "describe-log-groups",
+                  "filter-log-events"
+                ],
+                "region": "us-east-1"
+              },
+              {
+                "tool": "@tracker/get_issue",
+                "readonly": true
+              },
+              {
+                "tool": "MCP:search_issues",
+                "readonly": true
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "granted op",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "filter-log-events",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "granted op, CamelCase",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "FilterLogEvents",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "granted Kiro MCP tool",
+      "role": "security-reviewer",
+      "tool": "@tracker/get_issue",
+      "input": {
+        "id": "X-1"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "granted Cursor MCP tool",
+      "role": "security-reviewer",
+      "tool": "MCP:search_issues",
+      "input": {
+        "query": "D7"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "Kiro source does not grant a Cursor basename",
+      "role": "security-reviewer",
+      "tool": "MCP:get_issue",
+      "input": {
+        "id": "X-1"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not one the guard"
+    },
+    {
+      "name": "different Kiro MCP server stays denied",
+      "role": "security-reviewer",
+      "tool": "@other/get_issue",
+      "input": {
+        "id": "X-1"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not one the guard"
+    },
+    {
+      "name": "unknown Cursor MCP name stays denied",
+      "role": "security-reviewer",
+      "tool": "MCP:delete_issue",
+      "input": {
+        "id": "X-1"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not one the guard"
+    },
+    {
+      "name": "ungranted op",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "describe-log-streams",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not granted"
+    },
+    {
+      "name": "other region",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "filter-log-events",
+        "region": "eu-west-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "other service",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "ec2",
+        "operation_name": "describe-instances",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "write verb",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "delete-log-group",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not a read"
+    },
+    {
+      "name": "positional args",
+      "role": "security-reviewer",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "filter-log-events",
+        "region": "us-east-1",
+        "label": "x",
+        "positional_args": [
+          "x"
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "ungranted MCP tool",
+      "role": "security-reviewer",
+      "tool": "@tracker/update_issue",
+      "input": {
+        "id": "X-1"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not one the guard"
+    },
+    {
+      "name": "other role holds nothing",
+      "role": "tester",
+      "tool": "use_aws",
+      "input": {
+        "service_name": "logs",
+        "operation_name": "filter-log-events",
+        "region": "us-east-1",
+        "label": "x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    }
+  ]
+}

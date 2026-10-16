@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/lease-event.json",
+  "title": "Lease store event (~/.config/surgical-team/leases/*.jsonl, one per line); outside the repository",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "format": {
+          "const": 1
+        },
+        "event": {
+          "const": "open"
+        },
+        "order": {
+          "type": "string",
+          "pattern": "^WO-\\d{8}-\\d{3}$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "grant": {
+          "type": "string",
+          "pattern": "^(approval:[0-9a-f]{64}|standing:DEC-[0-9]+:[0-9a-f]{64})$"
+        },
+        "spec_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "not_after": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "event",
+        "order",
+        "attempt",
+        "grant",
+        "spec_sha",
+        "role",
+        "not_after"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "format": {
+          "const": 1
+        },
+        "event": {
+          "const": "close"
+        },
+        "order": {
+          "type": "string",
+          "pattern": "^WO-\\d{8}-\\d{3}$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "grant": {
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "reported",
+            "verdict",
+            "cancelled",
+            "reclaimed",
+            "superseded"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "event",
+        "order",
+        "attempt",
+        "grant",
+        "reason"
+      ]
+    }
+  ]
+}

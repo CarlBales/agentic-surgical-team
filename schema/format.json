@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/format.json",
+  "title": "Ledger format marker (.surgical-team/format.json)",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format"
+  ]
+}

@@ -1,0 +1,5 @@
+# Development and CI tools only. st itself has no runtime dependencies.
+coverage==7.16.2
+mypy==2.4.0
+ruff==0.13.0
+pyyaml==6.0.3     # tests/test_ci.py parses the workflow

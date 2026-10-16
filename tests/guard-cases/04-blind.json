@@ -1,0 +1,401 @@
+{
+  "about": "A blind tester order withholds src/.",
+  "fixture": {
+    "files": {
+      "src/upload.rs": "fn upload() {}\n",
+      "src/upload.py": "def upload(): pass\n",
+      "public/interface.py": "def upload(): pass\n",
+      "SPEC.md": "uploads retry\n"
+    },
+    "orders": [
+      {
+        "as": "A",
+        "spec": {
+          "blind": [
+            "src"
+          ]
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "read withheld file in repo",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{repo}/src/upload.rs"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read withheld file in workspace",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{ws}/src/upload.rs"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "grep a dir containing withheld paths",
+      "role": "tester",
+      "tool": "grep",
+      "input": {
+        "pattern": "fn",
+        "path": "{repo}"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "not a stop"
+    },
+    {
+      "name": "grep with include over repo containing withheld paths",
+      "role": "tester",
+      "tool": "grep",
+      "input": {
+        "pattern": "upload",
+        "path": "{repo}",
+        "include": "*.py"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "search a narrower path"
+    },
+    {
+      "name": "grep with include over workspace containing withheld paths",
+      "role": "tester",
+      "tool": "grep",
+      "input": {
+        "pattern": "upload",
+        "path": "{ws}",
+        "include": "**/*.py"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "search a narrower path"
+    },
+    {
+      "name": "grep with include under non-blind repo directory",
+      "role": "tester",
+      "tool": "grep",
+      "input": {
+        "pattern": "upload",
+        "path": "{repo}/public",
+        "include": "*.py"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "grep with include under non-blind workspace directory",
+      "role": "tester",
+      "tool": "grep",
+      "input": {
+        "pattern": "upload",
+        "path": "{ws}/public",
+        "include": "**/*.py"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "code search with include over withheld paths",
+      "role": "tester",
+      "tool": "code",
+      "input": {
+        "operation": "pattern_search",
+        "pattern": "$X",
+        "language": "python",
+        "path": "{repo}",
+        "include": "*.py"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "search a narrower path"
+    },
+    {
+      "name": "rg with glob over workspace",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "rg -g '*.py' upload ."
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "grep shell with include over workspace",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "grep -R --include='*.py' upload ."
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "rg with glob under non-blind directory",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "rg -g '*.py' upload public"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "cat withheld",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "cat src/upload.rs"
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "rg over workspace",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "rg upload ."
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read withheld repo file from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{repo}/src/upload.rs"
+          }
+        ]
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read withheld workspace file from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{ws}/src/upload.rs"
+          }
+        ]
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read withheld image from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Image",
+            "image_paths": [
+              "{ws}/src/upload.py"
+            ]
+          }
+        ]
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read withheld camelCase file path from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "filePath": "{ws}/src/upload.py"
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "cat withheld file with workspace working directory from non-repo cwd",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "cat src/upload.rs",
+        "working_dir": "{ws}"
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "cat withheld workspace file from non-repo cwd",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "cat {ws}/src/upload.rs"
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "blind"
+    },
+    {
+      "name": "read public workspace file from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{ws}/public/interface.py"
+          }
+        ]
+      },
+      "cwd": "tmp",
+      "expect": "allow"
+    },
+    {
+      "name": "read unrelated non-team path from non-repo cwd",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{tmp}/ordinary/README.md"
+          }
+        ]
+      },
+      "cwd": "tmp",
+      "expect": "allow"
+    },
+    {
+      "name": "write workspace file from non-repo cwd with live authority",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/new.txt",
+        "content": "draft"
+      },
+      "cwd": "tmp",
+      "expect": "allow"
+    },
+    {
+      "name": "write workspace file from non-repo cwd without role authority",
+      "role": "copilot",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/new.txt",
+        "content": "draft"
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "outside any workspace"
+    },
+    {
+      "name": "write project guard config from non-repo cwd",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{repo}/.cursor/hooks.json",
+        "content": "{}"
+      },
+      "cwd": "tmp",
+      "expect": "block",
+      "reason": "control-plane state"
+    },
+    {
+      "name": "read spec",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{repo}/SPEC.md"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "directory listing",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Directory",
+            "path": "{ws}"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "glob",
+      "role": "tester",
+      "tool": "glob",
+      "input": {
+        "pattern": "**/*",
+        "path": "{ws}"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "ls -R",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "ls -R"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "other roles unaffected",
+      "role": "copilot",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{repo}/src/upload.rs"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    }
+  ]
+}

@@ -4,7 +4,7 @@ description: Adversarial tester for the surgical team, run as the st-tester agen
 license: MIT
 metadata:
   author: the-surgical-team
-  version: "0.3"
+  version: "0.4"
   surgical-team-role: tester
 ---
 

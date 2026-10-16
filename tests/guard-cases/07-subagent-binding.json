@@ -1,0 +1,146 @@
+{
+  "about": "D2/N4: a subagent prompt carries its own order's briefing and never embeds another live order's briefing; a plain mention of another order (scope.out) is fine.",
+  "fixture": {
+    "orders": [
+      {
+        "as": "T"
+      },
+      {
+        "as": "T2",
+        "spec": {
+          "title": "parallel tester order"
+        }
+      },
+      {
+        "as": "R",
+        "spec": {
+          "role": "reviewer"
+        }
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "reviewer prompt cannot embed tester live briefing",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "review",
+        "stages": [
+          {
+            "name": "reviewer",
+            "role": "st-reviewer",
+            "prompt_template": "# Work order {wo:R} (attempt 1): review\n...\n# Work order {wo:T} (attempt 1): tests\n..."
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "without embedding the briefing of"
+    },
+    {
+      "name": "tester prompt cannot embed reviewer live briefing",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": "st-tester",
+            "prompt_template": "# Work order {wo:T} (attempt 1): tests\n...\n# work order {wo:R} (attempt 1): review"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "without embedding the briefing of"
+    },
+    {
+      "name": "a briefing may mention a parallel live order of another role",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": "st-tester",
+            "prompt_template": "# Work order {wo:T} (attempt 1): tests\nOut of scope: the review, owned by {wo:R}."
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "a briefing may mention a parallel live order of the same role",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": "st-tester",
+            "prompt_template": "# Work order {wo:T} (attempt 1): tests\nOut of scope: the parser, owned by {wo:T2}."
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "copilot casefolds a team agent name before validating it",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": "ST-tester",
+            "prompt_template": "# Work order {wo:T} (attempt 1): tests"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "copilot strips a team agent name before validating it",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": " st-tester",
+            "prompt_template": "# Work order {wo:T} (attempt 1): tests"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "without a header, two same-role mentions stay ambiguous",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "test",
+        "stages": [
+          {
+            "name": "tester",
+            "role": "st-tester",
+            "prompt_template": "tests for {wo:T} and {wo:T2}"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "exactly one order"
+    }
+  ]
+}

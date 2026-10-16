@@ -1,0 +1,422 @@
+{
+  "about": "No live order: L0 behavior, reads, key material, surgeon-only commands, code writes.",
+  "fixture": {},
+  "cases": [
+    {
+      "name": "L0 write in repo",
+      "role": "language-lawyer-rust",
+      "tool": "write",
+      "input": {
+        "path": "src/lib.rs"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 write in /tmp",
+      "role": "language-lawyer-rust",
+      "tool": "write",
+      "input": {
+        "path": "/tmp/x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "read a repo file",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "README.md"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "read the signing key",
+      "role": "tester",
+      "tool": "read",
+      "input": {
+        "operations": [
+          {
+            "mode": "Line",
+            "path": "{tmp}/key"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "key material"
+    },
+    {
+      "name": "st draft heredoc",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "st draft <<'EOF'\n{\"x\": 1}\nEOF"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "st status && list",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "st status && st list"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "fs_write alias",
+      "role": "tester",
+      "tool": "fs_write",
+      "input": {
+        "path": "x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "execute_bash alias",
+      "role": "tester",
+      "tool": "execute_bash",
+      "input": {
+        "command": "rm x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for copilot: st approve WO-20260101-001",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "st approve WO-20260101-001"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for copilot: bin/st accept WO-1",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "bin/st accept WO-1"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for copilot: st grant --role tester --max L2 --scope x",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "st grant --role tester --max L2 --scope x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for copilot: ssh-keygen -Y sign -f k",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {
+        "command": "ssh-keygen -Y sign -f k"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for tester: st approve WO-20260101-001",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "st approve WO-20260101-001"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for tester: bin/st accept WO-1",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "bin/st accept WO-1"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for tester: st grant --role tester --max L2 --scope x",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "st grant --role tester --max L2 --scope x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "surgeon-only for tester: ssh-keygen -Y sign -f k",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "ssh-keygen -Y sign -f k"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 viewer: git status",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "git status"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 viewer: rg TODO src",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "rg TODO src"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 viewer: cat README.md | head -5",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "cat README.md | head -5"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 viewer: ls -la",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "ls -la"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 viewer: git log --oneline -5",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "git log --oneline -5"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 viewer: git diff main",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "git diff main"
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "L0 mutator: echo x > README.md",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "echo x > README.md"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: rm -rf src",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "rm -rf src"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: touch new",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "touch new"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: cargo test",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "cargo test"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: python3 -c 'open(\"x\",\"w\")'",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "python3 -c 'open(\"x\",\"w\")'"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: git commit -am x",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "git commit -am x"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: npm install",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "npm install"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: sed -i '' s/a/b/ README.md",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "sed -i '' s/a/b/ README.md"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: find . -delete",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "find . -delete"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: echo $(rm -rf x)",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "echo $(rm -rf x)"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: make",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "make"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: ./scripts/anything.sh",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "./scripts/anything.sh"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "L0 mutator: git add .",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {
+        "command": "git add ."
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "code rewrite",
+      "role": "language-lawyer-rust",
+      "tool": "code",
+      "input": {
+        "operation": "pattern_rewrite",
+        "file_path": "{repo}/README.md",
+        "pattern": "a",
+        "replacement": "b",
+        "language": "python",
+        "dry_run": false
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "code rewrite dry run",
+      "role": "language-lawyer-rust",
+      "tool": "code",
+      "input": {
+        "operation": "pattern_rewrite",
+        "file_path": "{repo}/README.md",
+        "pattern": "a",
+        "replacement": "b",
+        "language": "python",
+        "dry_run": true
+      },
+      "cwd": "repo",
+      "expect": "allow"
+    },
+    {
+      "name": "code rewrite, dry_run omitted (A-2)",
+      "role": "language-lawyer-rust",
+      "tool": "code",
+      "input": {
+        "operation": "pattern_rewrite",
+        "file_path": "{repo}/README.md",
+        "pattern": "a",
+        "replacement": "b",
+        "language": "python"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    },
+    {
+      "name": "code rename_symbol",
+      "role": "language-lawyer-rust",
+      "tool": "code",
+      "input": {
+        "operation": "rename_symbol",
+        "file_path": "{repo}/x.rs"
+      },
+      "cwd": "repo",
+      "expect": "block"
+    }
+  ]
+}

@@ -1,0 +1,472 @@
+{
+  "about": "H2: no team role may start another agent host through a shell command, including from an L1 workspace.",
+  "fixture": {
+    "orders": [
+      {
+        "as": "A"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "copilot cannot start agent",
+      "role": "copilot",
+      "tool": "shell",
+      "input": {"command": "agent -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "editor cannot start cursor-agent",
+      "role": "editor",
+      "tool": "shell",
+      "input": {"command": "cursor-agent -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "toolsmith cannot start cursor",
+      "role": "toolsmith",
+      "tool": "shell",
+      "input": {"command": "cursor ."},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "tester cannot start kiro-cli from its workspace",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "kiro-cli chat --no-interactive --trust-all-tools x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "Rust lawyer cannot start kiro",
+      "role": "language-lawyer-rust",
+      "tool": "shell",
+      "input": {"command": "kiro chat x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "TypeScript lawyer cannot start Amazon Q chat",
+      "role": "language-lawyer-typescript",
+      "tool": "shell",
+      "input": {"command": "q chat x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "Python lawyer cannot start Claude",
+      "role": "language-lawyer-python",
+      "tool": "shell",
+      "input": {"command": "claude -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "C sharp lawyer cannot start Codex",
+      "role": "language-lawyer-csharp",
+      "tool": "shell",
+      "input": {"command": "codex x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "platform lawyer cannot start Gemini",
+      "role": "platform-lawyer-react-native",
+      "tool": "shell",
+      "input": {"command": "gemini -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "reviewer cannot start Aider",
+      "role": "reviewer",
+      "tool": "shell",
+      "input": {"command": "aider x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "security reviewer cannot start Goose",
+      "role": "security-reviewer",
+      "tool": "shell",
+      "input": {"command": "goose x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "infra reviewer cannot start OpenCode",
+      "role": "infra-reviewer",
+      "tool": "shell",
+      "input": {"command": "opencode x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "accessibility reviewer cannot start Copilot",
+      "role": "accessibility-reviewer",
+      "tool": "shell",
+      "input": {"command": "copilot x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "archaeologist cannot start agent by path",
+      "role": "archaeologist",
+      "tool": "shell",
+      "input": {"command": "~/.local/bin/agent -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "incident analyst cannot start cursor-agent by path",
+      "role": "incident-analyst",
+      "tool": "shell",
+      "input": {"command": "/opt/bin/cursor-agent -p x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "archivist cannot start Amazon Q chat",
+      "role": "archivist",
+      "tool": "shell",
+      "input": {"command": "q chat x"},
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct agent",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "agent -p --force x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct cursor-agent",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "cursor-agent -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct cursor",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "cursor ."},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct kiro-cli",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "kiro-cli chat x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct kiro",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "kiro chat x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Amazon Q chat",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "q chat x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Claude",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "claude -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Codex",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "codex x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Gemini",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "gemini -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Aider",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "aider x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Goose",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "goose x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct OpenCode",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "opencode x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "workspace direct Copilot",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "copilot x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "env wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "env FOO=bar agent -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "sh inline wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "sh -c 'agent -p x'"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "bash login inline wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "bash -lc 'kiro-cli chat x'"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "xargs wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "printf x | xargs agent -p"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "nohup wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "nohup cursor-agent -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "timeout wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "timeout 5s claude -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "command wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "command codex x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "exec wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "exec gemini -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "npx Anthropic package",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "npx @anthropic-ai/claude-code -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "npx versioned OpenAI package",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "npx --yes @openai/codex@latest x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "bunx OpenAI package",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "bunx @openai/codex x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "pnpm dlx Google package",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "pnpm dlx @google/gemini-cli x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "uvx cursor-agent package",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "uvx cursor-agent -p x"},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "Python os.system wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "python3 -c \"import os; os.system('agent -p x')\""},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "Python subprocess argv wrapper",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "python3 -c \"import subprocess; subprocess.run(['kiro-cli', 'chat', 'x'])\""},
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "agent-host CLI"
+    },
+    {
+      "name": "Amazon Q non-chat command remains available",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "q doctor"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "grep argument named agent is not a command",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "grep agent x"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "cat filename containing agent is not a command",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "cat agent.md"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "Python filename containing agent is not a command",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "python3 agent.py"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "Python data containing agent is not a command",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "python3 -c \"print('agent')\""},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "st itself remains available",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "st status"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "ordinary npx package containing agent remains available",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "npx some-agent-helper"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "ordinary timeout command remains available",
+      "role": "tester",
+      "tool": "shell",
+      "input": {"command": "timeout 1s true"},
+      "cwd": "ws:A",
+      "expect": "allow"
+    }
+  ]
+}

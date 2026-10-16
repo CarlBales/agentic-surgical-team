@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/verdict-record.json",
+  "title": "Ledger verdict record (.surgical-team/verdicts/WO-*.aN.json)",
+  "type": "object",
+  "properties": {
+    "order": {
+      "type": "string",
+      "pattern": "^WO-\\d{8}-\\d{3}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "format": {
+      "const": 1
+    },
+    "signed": {
+      "allOf": [
+        {
+          "$ref": "signed.json"
+        },
+        {
+          "properties": {
+            "payload": {
+              "properties": {
+                "kind": {
+                  "const": "verdict"
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "order",
+    "attempt",
+    "format",
+    "signed"
+  ]
+}

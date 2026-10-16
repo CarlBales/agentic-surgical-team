@@ -16,7 +16,7 @@ description: <Lang> language specialist for the surgical team. Judges correctnes
 license: MIT
 metadata:
   author: the-surgical-team
-  version: "0.3"
+  version: "0.4"
   surgical-team-role: language-lawyer
   language: <lang>
 ---

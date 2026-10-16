@@ -27,10 +27,26 @@ surgeon's machine. `st dispatch` writes an `open` event and `st report`,
 ledger shows as `dispatched` with no live lease on this machine is labelled
 `NO LIVE LEASE HERE` on the board and has no authority.
 
+## Format and schemas
+
+Every record carries `"format": 1`, and `format.json` holds the ledger's
+format. The JSON Schemas for each record, the order spec, the report, signed
+payloads, and lease events are in the team repository's `schema/` directory;
+they are the contract any implementation of `st` must honor. `st draft`
+refuses unknown spec fields, so a misspelled `blind` is an error, not a
+silently dropped constraint.
+
+`st` reads older formats but writes only the current one: on an older
+ledger, writes stop with `run: st migrate` (surgeon-only; `--dry-run`
+shows the changes). Migration never edits a spec, so approvals stay valid.
+A ledger in a format newer than the installed `st` understands is refused,
+and the guard grants no authority from it.
+
 ## Structure
 
 ```
 .surgical-team/
+├── format.json            # on-disk format version (`st migrate` upgrades)
 ├── STATUS.md              # generated board; never edited
 ├── events.jsonl           # append-only event log
 ├── orders/WO-….json       # spec, state, history, approval, dispatch

@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Local validation: the gate CI used to run, on this machine.
+
+    scripts/check                     # the push gate on the working tree
+    scripts/check --commit SHA        # the push gate on a commit, in a clean clone
+    scripts/check --full              # also branch coverage and full mutation testing
+    scripts/check --linux             # also the unit suite in a Linux container (podman/docker)
+    scripts/check --scenarios [--runs N]   # also live agent scenarios (spends tokens)
+    scripts/check push [GIT PUSH ARGS]   # the gate with live scenarios, then git push
+    scripts/check pre-push REMOTE URL # called by the installed pre-push hook
+    scripts/check --install-hook      # install that hook into this clone's .git/hooks
+
+The push gate: ruff, mypy --strict, skills validation, the unit suite on this
+Python and on the supported floor (/usr/bin/python3 on macOS, if it is 3.9),
+the suite again black-box against bin/st, guard latency, and mutation testing
+of the guard files the push changes.
+
+Why a clean clone: a pre-push hook runs in whatever state the checkout is in,
+so testing the working tree could pass on uncommitted or untracked files the
+pushed commit does not contain. The clone shares objects with this repository
+(cheap), has its own config, and no hooks.
+
+The hook also refuses to push anything but a scripts/publish snapshot to a
+public remote (st.publicRemote, or any github.com/gitlab.com/... URL), even
+with ST_SKIP_CHECK=1, so the internal history cannot be pushed there by habit.
+
+Why .git/hooks and not a tracked core.hooksPath: a relative hooksPath resolves
+in whichever checkout runs git, so every order workspace would carry its own
+writable copy of the hook. .git/hooks is read-only for agents (the guard) and
+in scripts/sandbox, and the hook refuses to run outside the main checkout.
+
+Why `scripts/check push`: git opens the connection to the remote before it
+runs pre-push, and the remote closes an idle connection long before the live
+scenarios finish (seen: a remote dropped it during a 35-minute run, so the push
+failed after everything passed). So the scenarios run before git connects. A
+passing check records a stamp per commit in .git/st-check/; the hook accepts a
+stamped commit at once. On a plain `git push` of an unstamped commit, the hook
+runs the deterministic gate itself (minutes), and if the push changes what
+agents run, it refuses at once and says to use `scripts/check push`.
+
+Environment for the pre-push hook:
+    ST_SKIP_SCENARIOS=1    skip live scenarios for this push
+    ST_SKIP_CHECK=1        skip the whole gate for this push (prefer fixing it)
+    ST_SCENARIO_RUNS=N     runs per scenario on push (default 1)
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parent.parent
+ZERO = "0" * 40
+FLOOR = (3, 9)
+
+# Guard files mutate_guard.py targets, relative to src/surgical_team/.
+MUTATION_TARGETS = ("guard/core.py", "guard/shellcheck.py", "guard/cursor.py",
+                    "guard/sessions.py", "guard/hosts.py", "tools.py")
+# A push touching any of these can change what a live agent does.
+SCENARIO_PATHS = ("src/", "bin/", "skills/", "tests/scenarios.py")
+SCENARIO_CLIS = {"kiro": ("kiro-cli",), "cursor": ("cursor-agent", "agent")}
+
+HOOK = """#!/bin/sh
+# Installed by scripts/check --install-hook. Runs the local gate on each pushed commit.
+# It lives in .git/hooks (read-only to team agents) and runs only in the main checkout.
+git_dir=$(git rev-parse --absolute-git-dir) || exit 1
+common=$(cd "$(git rev-parse --git-common-dir)" && pwd -P) || exit 1
+if [ "$(cd "$git_dir" && pwd -P)" != "$common" ]; then
+  echo "pre-push: refusing to push from a linked worktree; push from the main checkout" >&2
+  exit 1
+fi
+top=$(git rev-parse --show-toplevel) || exit 1
+exec python3 "$top/scripts/check" pre-push "$@"
+"""
+
+
+def say(message: str) -> None:
+    print(f"check: {message}", flush=True)
+
+
+def git(args: list[str], cwd: Path | None = None) -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(["git", *args], cwd=cwd or ROOT, env=env, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+# ---- which tree, which steps -------------------------------------------------
+
+def clean_clone(sha: str, into: Path) -> Path:
+    """A clone of `sha` that shares this repository's objects."""
+    tree = into / "tree"
+    git(["clone", "-q", "--shared", "--no-checkout", str(ROOT), str(tree)])
+    git(["-c", "advice.detachedHead=false", "checkout", "-q", "--detach", sha], cwd=tree)
+    return tree
+
+
+def floor_python() -> str | None:
+    """An interpreter at the supported floor, if this machine has one."""
+    for candidate in ("/usr/bin/python3", shutil.which("python3.9")):
+        if not candidate or not Path(candidate).exists():
+            continue
+        out = subprocess.run([candidate, "-c", "import sys; print(sys.version_info[:2])"],
+                             capture_output=True, text=True, check=False)
+        if out.returncode == 0 and out.stdout.strip() == str(FLOOR):
+            return candidate
+    return None
+
+
+def mutation_files(changed: list[str] | None) -> list[str]:
+    """Guard files to mutate: those changed, or all of them when unknown."""
+    if changed is None:
+        return list(MUTATION_TARGETS)
+    prefix = "src/surgical_team/"
+    return [t for t in MUTATION_TARGETS if prefix + t in changed]
+
+
+def affects_agents(changed: list[str] | None) -> bool:
+    return changed is None or any(p.startswith(SCENARIO_PATHS) for p in changed)
+
+
+def scenario_hosts() -> list[str]:
+    return [host for host, clis in SCENARIO_CLIS.items()
+            if any(shutil.which(cli) for cli in clis)]
+
+
+# ---- running steps -----------------------------------------------------------
+
+# A runtime alias, so no `X | None` (3.10+); annotations elsewhere are strings.
+Step = tuple[str, list[str], Optional[dict[str, str]], Optional[Path]]
+
+
+class Gate:
+    def __init__(self, tree: Path, venv: Path) -> None:
+        self.tree = tree
+        self.venv = venv
+        self.failed: list[str] = []
+
+    def tool(self, name: str) -> str:
+        path = self.venv / "bin" / name
+        if not path.exists():
+            sys.exit(f"check: {path} is missing; run: python3 -m venv .venv && "
+                     ".venv/bin/pip install -r requirements-dev.txt")
+        return str(path)
+
+    def run(self, name: str, argv: list[str], env: dict[str, str] | None = None,
+            cwd: Path | None = None) -> bool:
+        return self.parallel([(name, argv, env, cwd)])
+
+    def parallel(self, steps: list[Step]) -> bool:
+        """Run steps at once; print each one's last line, or its tail on failure."""
+        started = time.monotonic()
+        ok = True
+        with contextlib.ExitStack() as stack:
+            procs = []
+            for name, argv, env, cwd in steps:
+                log = stack.enter_context(tempfile.TemporaryFile(mode="w+"))
+                procs.append((name, log, subprocess.Popen(
+                    argv, cwd=cwd or self.tree, stdout=log, stderr=subprocess.STDOUT,
+                    text=True, env={**os.environ, **(env or {})})))
+            for name, log, proc in procs:
+                code = proc.wait()
+                log.seek(0)
+                lines = log.read().rstrip().splitlines() or [""]
+                if code:
+                    ok = False
+                    self.failed.append(name)
+                    tail = "\n".join("       " + line for line in lines[-25:])
+                    print(f"  FAIL {name}\n{tail}")
+                else:
+                    print(f"  ok   {name}: {lines[-1]}")
+        say(f"{'+'.join(s[0] for s in steps)} took {time.monotonic() - started:.0f}s")
+        return ok
+
+
+def push_gate(gate: Gate, changed: list[str] | None) -> None:
+    py = sys.executable
+    gate.parallel([
+        ("ruff", [gate.tool("ruff"), "check", "src", "scripts/check", "scripts/publish"],
+         None, None),
+        # One mypy process: two sharing a fresh .mypy_cache crash intermittently.
+        # Sequential in one step: scripts without a suffix are each `__main__` to mypy.
+        ("mypy", ["sh", "-c", f'"{gate.tool("mypy")}" src/surgical_team scripts/check && '
+                  f'"{gate.tool("mypy")}" --strict scripts/publish'], None, None),
+        ("skills", ["bash", "scripts/validate-skills.sh"], None, None),
+    ])
+    here = "tests (py{}.{})".format(*sys.version_info[:2])
+    suites: list[Step] = [(here, [py, "tests/run.py"], None, None)]
+    floor = floor_python()
+    if floor and floor != py:
+        suites.append(("tests (py3.9 floor)", [floor, "tests/run.py"], None, None))
+    else:
+        say("no Python 3.9 found; the floor is checked only by CI")
+    gate.parallel(suites)
+    gate.run("tests (black box)", [py, "tests/run.py"], {"ST_TEST_MODE": "subprocess"})
+    # Alone, so other steps do not skew the timing.
+    gate.run("guard latency", [py, "tests/bench_guard.py", "--budget-ms", "120"])
+    files = mutation_files(changed)
+    if files:
+        argv = [py, "tests/mutate_guard.py", "-j", str(os.cpu_count() or 4)]
+        for f in files:
+            argv += ["--file", f]
+        gate.run(f"mutation ({', '.join(files)})", argv)
+    else:
+        say("no guard file changed; mutation testing skipped")
+
+
+def full_extras(gate: Gate, changed: list[str] | None) -> None:
+    coverage = gate.tool("coverage")
+    gate.run("coverage (branch, >= 85%)", ["sh", "-c",
+             f"cd tests && {coverage} run --branch --source=../src -m unittest discover -s . "
+             f"-q 2>/dev/null && {coverage} report --fail-under=85 | tail -1"])
+    if mutation_files(changed) != list(MUTATION_TARGETS):  # else the gate already ran it all
+        gate.run("mutation (all)", [sys.executable, "tests/mutate_guard.py",
+                                    "-j", str(os.cpu_count() or 4)])
+
+
+LINUX_IMAGE = "localhost/surgical-team-check:python39-git-openssh-v1"
+LINUX_DOCKERFILE = ("FROM docker.io/library/python:3.9-slim\n"
+                    "RUN apt-get update && apt-get install -y --no-install-recommends git "
+                    "openssh-client && rm -rf /var/lib/apt/lists/*\n")
+
+
+def linux(gate: Gate) -> None:
+    """The suite on Linux at the floor; the image is built once (network), then
+    runs offline with the tree mounted read-only."""
+    runtime = shutil.which("podman") or shutil.which("docker")
+    if not runtime:
+        say("no podman or docker; Linux is checked only by CI")
+        return
+    if subprocess.run([runtime, "image", "inspect", LINUX_IMAGE], capture_output=True,
+                      check=False).returncode:
+        with tempfile.TemporaryDirectory() as context:
+            (Path(context) / "Dockerfile").write_text(LINUX_DOCKERFILE)
+            build = [runtime, "build", "-q", "-t", LINUX_IMAGE, context]
+            if not gate.run("build Linux image", build):
+                return
+    # The container gets a plain git repository of the tree, not the tree's .git:
+    # a --shared clone's objects live at a host path the container cannot see.
+    script = ("git config --global user.name ci && git config --global user.email ci@x.invalid"
+              " && git config --global init.defaultBranch main && mkdir /w && cd /src"
+              " && git ls-files -z | xargs -0 cp --parents -t /w && cd /w && git init -q"
+              " && git add -A && git commit -qm tree && python tests/run.py")
+    gate.run("tests (Linux, py3.9)", [runtime, "run", "--rm", "--network=none", "-v",
+                                       f"{gate.tree}:/src:ro", "-e", "GIT_CONFIG_PARAMETERS="
+                                       "'safe.directory=*'", LINUX_IMAGE, "sh", "-c", script])
+
+
+def scenarios(gate: Gate, runs: int) -> None:
+    """Every installed host at once: each scenario has its own sandbox and
+    config dir, and the hosts are different CLIs, so they do not interfere."""
+    hosts = scenario_hosts()
+    for host in SCENARIO_CLIS:
+        if host not in hosts:
+            say(f"no {host} CLI on PATH; {host} scenarios skipped")
+    gate.parallel([(f"scenarios ({host}, {runs} run{'s' if runs > 1 else ''})",
+                    [sys.executable, "tests/scenarios.py", "--host", host, "--runs", str(runs)],
+                    None, None) for host in hosts])
+
+
+# ---- stamps: commits that already passed ----------------------------------------
+
+GATE, WITH_SCENARIOS = "gate", "scenarios"
+
+
+def stamp_path(sha: str) -> Path:
+    common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    return common / "st-check" / sha
+
+
+def stamped(sha: str) -> str | None:
+    path = stamp_path(sha)
+    return path.read_text().strip() if path.is_file() else None
+
+
+def stamp(sha: str, level: str) -> None:
+    if stamped(sha) == WITH_SCENARIOS:
+        return  # never downgrade
+    path = stamp_path(sha)
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(level + "\n")
+
+
+def satisfied(sha: str, needs_scenarios: bool) -> bool:
+    level = stamped(sha)
+    return level == WITH_SCENARIOS or (level == GATE and not needs_scenarios)
+
+
+# ---- entry points --------------------------------------------------------------
+
+def changed_files(local: str, remote_sha: str, remote: str) -> list[str] | None:
+    """Files the push changes, or None (unknown: check everything)."""
+    base = remote_sha if remote_sha != ZERO else None
+    if base is None:  # a new branch: compare with the remote's default branch
+        for ref in (f"refs/remotes/{remote}/HEAD", f"refs/remotes/{remote}/main"):
+            try:
+                base = git(["merge-base", local, ref])
+                break
+            except subprocess.CalledProcessError:
+                continue
+    try:
+        git(["cat-file", "-e", f"{base}^{{commit}}"]) if base else None
+    except subprocess.CalledProcessError:
+        base = None  # the remote moved to a commit we do not have
+    if base is None:
+        return None
+    return git(["diff", "--name-only", base, local]).splitlines()
+
+
+def plan_pushes(remote: str, stdin: list[str]) -> dict[str, list[str] | None]:
+    """Each pushed commit once, with the union of what its refs change.
+
+    The hook gets `<local ref> <local sha> <remote ref> <remote sha>` per ref.
+    Deletions push nothing. Unknown changes (None) win over any known set."""
+    pushes: dict[str, list[str] | None] = {}
+    for line in stdin:
+        parts = line.split()
+        if len(parts) != 4 or parts[1] == ZERO:
+            continue
+        local = parts[1]
+        files = changed_files(local, parts[3], remote)
+        if local in pushes:
+            before = pushes[local]
+            files = None if before is None or files is None else sorted(set(before) | set(files))
+        pushes[local] = files
+    return pushes
+
+
+def working_tree_changes() -> list[str] | None:
+    """Files that differ from the upstream branch, committed or not; None if no upstream."""
+    try:
+        base = git(["merge-base", "HEAD", "@{upstream}"])
+    except subprocess.CalledProcessError:
+        return None
+    tracked = git(["diff", "--name-only", base]).splitlines()
+    untracked = git(["ls-files", "--others", "--exclude-standard"]).splitlines()
+    return sorted(set(tracked) | set(untracked))
+
+
+def check(sha: str | None, changed: list[str] | None, args: argparse.Namespace) -> int:
+    with tempfile.TemporaryDirectory(prefix="st-check-") as tmp:
+        tree = clean_clone(sha, Path(tmp)) if sha else ROOT
+        say(f"checking {sha[:12] if sha else 'the working tree'} in {tree}")
+        gate = Gate(tree, ROOT / ".venv")
+        push_gate(gate, changed)
+        if args.full:
+            full_extras(gate, changed)
+        if args.linux:
+            linux(gate)
+        # Live agents only once the deterministic gate passes: they are slow and cost tokens.
+        if args.scenarios and not gate.failed:
+            scenarios(gate, args.runs)
+        elif args.scenarios:
+            say("scenarios skipped: the gate failed")
+    if gate.failed:
+        say("FAILED: " + ", ".join(gate.failed))
+        return 1
+    if sha:  # a clean clone of one commit: the result belongs to that commit
+        stamp(sha, WITH_SCENARIOS if args.scenarios else GATE)
+    say("all passed")
+    return 0
+
+
+# ---- public remotes ---------------------------------------------------------------
+
+PUBLIC_HOSTS = {"github.com", "gitlab.com", "codeberg.org", "bitbucket.org"}
+
+
+def url_host(url: str) -> str:
+    """The host of an ssh, scp-style, or http(s) git URL ('' for a path)."""
+    match = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)", url, re.I)
+    if match:
+        return match.group(1).lower()
+    match = re.match(r"^(?:[^@/]+@)?([^/:]+):", url)  # user@host:path
+    return match.group(1).lower() if match and "/" not in match.group(1) else ""
+
+
+def is_public(remote: str, url: str) -> bool:
+    """The configured public remote, or any remote on a public forge."""
+    try:
+        configured = git(["config", "--get", "st.publicRemote"])
+    except subprocess.CalledProcessError:
+        configured = ""
+    return bool(configured and remote == configured) or url_host(url) in PUBLIC_HOSTS
+
+
+def published(sha: str) -> bool:
+    common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    return (common / "st-publish" / sha).is_file()
+
+
+def public_leaks(stdin: list[str]) -> list[str]:
+    """Refs that would put a commit scripts/publish did not make on a public remote."""
+    return [parts[0] for parts in (line.split() for line in stdin)
+            if len(parts) == 4 and parts[1] != ZERO and not published(parts[1])]
+
+
+def pre_push(remote: str, stdin: list[str], args: argparse.Namespace, url: str = "") -> int:
+    # Before ST_SKIP_CHECK: skipping the gate must never publish the internal history.
+    if is_public(remote, url or remote):
+        leaks = public_leaks(stdin)
+        if leaks:
+            say(f"{remote} is a public remote, and {', '.join(leaks)} would publish this "
+                "repository's internal history (commits, authors, deleted files). Publish a "
+                "scanned snapshot instead: scripts/publish")
+            return 1
+    if os.environ.get("ST_SKIP_CHECK") == "1":
+        say("ST_SKIP_CHECK=1: gate skipped for this push")
+        return 0
+    pushes = plan_pushes(remote, stdin)
+    if not pushes:
+        return 0
+    want_scenarios = os.environ.get("ST_SKIP_SCENARIOS") != "1"
+    if not want_scenarios:
+        say("ST_SKIP_SCENARIOS=1: live scenarios skipped for this push")
+    for sha, files in pushes.items():
+        needs = want_scenarios and affects_agents(files)
+        if satisfied(sha, needs):
+            say(f"{sha[:12]} already passed ({stamped(sha)}); not re-checked")
+            continue
+        if needs:
+            # Refuse now, before the remote's connection times out on us.
+            say(f"{sha[:12]} changes what agents run, so the live scenarios must pass, and "
+                "they outlast the push connection. Check, then push, with:\n"
+                "         scripts/check push" + "".join(f" {a}" for a in args.push_args) +
+                "\n       or push without the scenarios: ST_SKIP_SCENARIOS=1 git push")
+            return 1
+        if want_scenarios:
+            say("the push changes nothing agents run; scenarios skipped")
+        args.scenarios = False
+        if check(sha, files, args):
+            say("push refused; fix the failure, or skip once with ST_SKIP_CHECK=1 git push")
+            return 1
+    return 0
+
+
+def upstream_changes(sha: str) -> list[str] | None:
+    """Files `sha` changes relative to its upstream, or None without one."""
+    try:
+        base = git(["merge-base", sha, "@{upstream}"])
+    except subprocess.CalledProcessError:
+        return None
+    return git(["diff", "--name-only", base, sha]).splitlines()
+
+
+def check_then_push(push_args: list[str], args: argparse.Namespace) -> int:
+    """The whole gate on HEAD, scenarios included, before git opens a connection."""
+    sha = git(["rev-parse", "--verify", "HEAD^{commit}"])
+    files = upstream_changes(sha)
+    want = os.environ.get("ST_SKIP_SCENARIOS") != "1"
+    args.scenarios = want and affects_agents(files)
+    if not satisfied(sha, args.scenarios):
+        if want and not args.scenarios:
+            say("the push changes nothing agents run; scenarios skipped")
+        if check(sha, files, args):
+            say("not pushed; fix the failure, or skip once with ST_SKIP_CHECK=1 git push")
+            return 1
+    say("pushing: git push" + "".join(f" {a}" for a in push_args))
+    return subprocess.run(["git", "push", *push_args], cwd=ROOT, check=False).returncode
+
+
+def install_hook() -> int:
+    common = Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    git_dir = Path(git(["rev-parse", "--absolute-git-dir"]))
+    if git_dir.resolve() != common.resolve():
+        sys.exit("check: run --install-hook from the main checkout, not a linked worktree")
+    hook = common / "hooks" / "pre-push"
+    if hook.exists() and hook.read_text() != HOOK:
+        sys.exit(f"check: {hook} exists and was not written by this script; "
+                 "move it aside and re-run")
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(HOOK)
+    hook.chmod(0o755)
+    say(f"installed {hook}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("mode", nargs="*", help="`pre-push REMOTE URL` (used by the hook)")
+    ap.add_argument("--commit", help="check this commit in a clean clone")
+    ap.add_argument("--full", action="store_true", help="also coverage and full mutation")
+    ap.add_argument("--linux", action="store_true", help="also the suite in a Linux container")
+    ap.add_argument("--scenarios", action="store_true", help="also live agent scenarios")
+    ap.add_argument("--runs", type=int, default=int(os.environ.get("ST_SCENARIO_RUNS", "1")))
+    ap.add_argument("--install-hook", action="store_true")
+    if argv[:1] == ["push"]:  # everything after `push` belongs to git push
+        args = ap.parse_args([])
+        return check_then_push(argv[1:], args)
+    args = ap.parse_args(argv)
+    args.push_args = []
+    if args.install_hook:
+        return install_hook()
+    if args.mode[:1] == ["pre-push"]:
+        remote = args.mode[1] if len(args.mode) > 1 else "origin"
+        url = args.mode[2] if len(args.mode) > 2 else ""
+        return pre_push(remote, sys.stdin.read().splitlines(), args, url)
+    if args.mode:
+        ap.error(f"unknown mode {args.mode[0]!r}")
+    if args.commit:
+        sha = git(["rev-parse", "--verify", args.commit + "^{commit}"])
+        return check(sha, None, args)
+    return check(None, working_tree_changes(), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

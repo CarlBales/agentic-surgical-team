@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/report.json",
+  "title": "Report input to st report (unknown fields are kept but not interpreted)",
+  "type": "object",
+  "properties": {
+    "status": {
+      "enum": [
+        "DONE",
+        "PARTIAL",
+        "BLOCKED",
+        "DECLINED"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "met": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "met"
+        ]
+      }
+    },
+    "evidence": {},
+    "risks": {},
+    "recommended": {},
+    "out_of_scope": {
+      "type": "array"
+    },
+    "blocker": {
+      "type": "string"
+    },
+    "cost": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
+  "required": [
+    "status",
+    "summary"
+  ]
+}

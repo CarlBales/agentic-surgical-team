@@ -368,6 +368,14 @@ approval's expiry. It cannot sign, because `st setup` refuses keys that sign
 without a passphrase, touch, or confirmation. The strong control remains a
 container with the main checkout and `~/.config/surgical-team` read-only.
 
+**Update (2026-10-14, D1/I6).** That last sentence records the original
+intent, not the working mount layout. `scripts/sandbox` now keeps the main
+checkout's source, `allowed_signers`, and `config.json` read-only, but overlays
+`.surgical-team/`, `.git/`, leases, and Cursor bindings read-write so the team
+can run. Those writable records cannot grant more authority than an unexpired
+surgeon-signed spec; see the current authority-level reference for the exact
+boundary.
+
 **Evidence.** 65 unit tests pass. `TestLeases` (10 tests) covers rollback
 plus deleted report, missing lease, planted standing-order order, spec swap,
 role swap, expiry on use and at dispatch, pre-0.3 approvals, revise and
@@ -377,3 +385,79 @@ tests fail. Live: `tests/scenarios.py` 5/5; and a real `st-tester` agent given
 the briefing of a reported order whose ledger was rolled back and whose
 report was deleted was BLOCKED on its write, with the board showing `NO LIVE
 LEASE HERE`.
+
+---
+
+## Audit round 3 — 2026-10-12 (S-1)
+
+Found during the `st` evolution review ([st-evolution.md](st-evolution.md)).
+
+| # | Finding | Severity | Fix | Regression test |
+|---|---|---|---|---|
+| S-1 | `eval` in a workspace was allowed without checking its argument, and its `cd` moved later segments: `eval "cd ../../proj; rm README.md"` modified the main checkout in a live probe | High | `eval` arguments are checked as a command and its working directory carried forward | `test_s1_hidden_code_and_eval` |
+| S-1a | Siblings: `trap`, `alias`, `env -S`/`--split-string`, `source`/`.`, shells reading stdin (`| sh`, `bash <<<`, heredoc, `-s`, `/dev/stdin`), combined shell flags (`-lc`, `-fc`) skipping the `-c` recursion, interpreters reading code from stdin | High | All refused; combined `-c` flags recurse; quoted program names with whitespace refused | same |
+
+Evidence: 21 probes blocked by the guard; the six that reached the main
+checkout through real bash before the fix leave it intact after; 79 unit
+tests pass.
+
+**Note (M-4, 2026-10-12).** The guard tests named above as evidence
+(`test_audit_bypasses_from_inside_a_workspace`, `test_code_rewrite_is_a_write`,
+`test_unknown_and_disguised_tool_names_fail_closed`,
+`test_inplace_flags_and_git_directory_options`, `test_s1_hidden_code_and_eval`,
+the blind, subagent, and push tests) moved into the conformance corpus in
+`tests/guard-cases/`, case for case; their cases are named `audit 1: …`,
+`audit 2 …`, `S-1: …`. Tests that need to tamper with the ledger mid-test
+stay in `tests/test_st.py`.
+
+## Mutation testing — 2026-10-12 (M-6)
+
+`tests/mutate_guard.py` replaced each of the guard's 61 refusals with an allow
+and ran the corpus and the ledger-tampering suites against each mutant. Nine
+survived, meaning no test needed those refusals. Corpus cases now pin all 61.
+Two of the new cases found real gaps, both fixed:
+
+| # | Finding | Fix |
+|---|---|---|
+| M6-a | `git apply --directory=$D` from a workspace was allowed. An unresolved value with no `/` skipped the path check, though it can expand to the main checkout | git options that choose where it writes (`--directory`, `--prefix`, `-C`, `--work-tree`, `--git-dir`, `--output`, …) must be literal |
+| M6-b | An MCP source named `../x` passed `inputs.sources` validation (found by the new pure-function tests) | name segments must start with a word character |
+
+## Fail-open hook — 2026-10-12
+
+Found while adding the P-1 launcher fast path. Kiro blocks a tool call only
+when a preToolUse hook exits 2; for any other non-zero exit it "shows a
+warning and allows tool execution" (Kiro hooks documentation). The installed
+hook ran `st guard --role R` directly, so a guard that could not run allowed
+every call: an import error exited 1, a non-executable `st` exited 126, a
+missing interpreter 127.
+
+| # | Finding | Severity | Fix | Regression test |
+|---|---|---|---|---|
+| H-1 | A broken guard fails open | High | `st install` wraps the hook: any exit other than 0 or 2 becomes 2 with a BLOCKED message; the launcher's fast path also exits 2 if the guard fails to import | `TestHookFailsClosed` (syntax error, import error, missing and non-executable `st`, run through `sh -c`) |
+
+Not covered: a hook that exceeds its timeout (15 s). Kiro's documentation
+does not say whether a timed-out preToolUse hook blocks. Existing installs
+need `st install` re-run to get the wrapper.
+
+## Shell grammar narrowed — 2026-10-12 (M-5)
+
+S-1 fixed `eval` and stdin; probing the rest of the shell model for M-5
+found the same class of hole wherever the guard treated a construct's first
+word as the program. From a workspace, each of these ran a write outside it
+through real bash while the guard allowed the call:
+
+| # | Finding | Fix |
+|---|---|---|
+| M5-1 | A leading keyword hid the real command: `for x in 1; do cd /elsewhere; done; touch x`, and the same with `if`/`then`, `while`, `until`, `!`, `time`, `case`, `select`. The keyword was taken as the program, so the `cd` was never tracked and the later relative write was never checked | A segment whose first token is a shell keyword is denied; complex logic goes in a workspace script |
+| M5-2 | Command substitution ran unseen: `echo $(touch /elsewhere)`, `` `...` ``, `"$(...)"`, `x=$(...)`, `${x:-$(...)}`, and `$(...)` in an unquoted heredoc body. Only bare substitution *outside* a workspace was caught before | A quote- and heredoc-aware scan denies command and process substitution anywhere, keeping arithmetic `$((…))` and parameter `${…}` |
+
+The guard now accepts only the grammar it models: simple commands,
+pipelines, `;`/`&&`/`||`, literal redirects, and `cd` to a literal path.
+This narrows what agents can type in one shell call; loops, conditionals,
+and substitutions belong in a script run from the workspace, which runs as
+the user and is the documented sandbox boundary either way.
+
+Evidence: 23 live probes, all contained (0 escaped) where 12 escaped
+before; arithmetic and quoted-heredoc controls still allowed; corpus
+236/236; 62/62 guard mutants killed; `substitution_reason` and keyword
+detection unit-tested.

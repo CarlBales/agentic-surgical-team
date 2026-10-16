@@ -1,0 +1,97 @@
+{
+  "about": "Workspace Git metadata is host-executed state, not agent-editable project content.",
+  "fixture": {
+    "orders": [
+      {
+        "as": "A"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "write the workspace gitfile",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/.git"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "git metadata runs on the host"
+    },
+    {
+      "name": "write nested git config",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/sub/.git/config"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "git metadata runs on the host"
+    },
+    {
+      "name": "write workspace git hook",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/.git/hooks/x"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "git metadata runs on the host"
+    },
+    {
+      "name": "redirect over the workspace gitfile",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "printf 'gitdir: .evil\\n' > .git"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "git metadata runs on the host"
+    },
+    {
+      "name": "file mutator targets nested git metadata",
+      "role": "tester",
+      "tool": "shell",
+      "input": {
+        "command": "touch sub/.git/config"
+      },
+      "cwd": "ws:A",
+      "expect": "block",
+      "reason": "git metadata runs on the host"
+    },
+    {
+      "name": "gitignore remains project content",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/.gitignore"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "gitmodules remains project content",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/.gitmodules"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    },
+    {
+      "name": "ordinary source remains writable",
+      "role": "tester",
+      "tool": "write",
+      "input": {
+        "path": "{ws}/src/x.py"
+      },
+      "cwd": "ws:A",
+      "expect": "allow"
+    }
+  ]
+}

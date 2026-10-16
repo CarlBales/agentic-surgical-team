@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Publish a sanitized snapshot of this repository to a public remote.
+
+    scripts/publish --scan            # scan what would be published; change nothing
+    scripts/publish --dry-run         # also build the public commit; push nothing
+    scripts/publish [-m MESSAGE]      # build, gate, and push the public commit
+
+Setup, once per clone (local git config and files; nothing here is committed):
+
+    git remote add public git@github.com:OWNER/REPO.git
+    git config st.publicRemote public
+    git config st.publishIdentity "Name <ID+user@users.noreply.github.com>"
+    $EDITOR .git/info/publish-denylist   # one regex per line (see below)
+
+The denylist names what must never ship: employer names and hosts, internal
+repository and product names, vendors, people. It lives outside the tracked
+tree on purpose: the list of names is as sensitive as the names.
+~/.config/surgical-team/publish-denylist (or $ST_CONFIG_DIR/...) is read too.
+
+What a publish does, in order:
+
+1. HEAD must be clean and must have passed scripts/check (its stamp), with the
+   live scenarios if the publish changes what agents run.
+2. Export HEAD with `git archive`, so export-ignore paths (internal docs) stay
+   out. Scan every exported path and line, and the commit message, against
+   built-in rules (keys, tokens, home directories, personal email addresses,
+   confidentiality markers) and the denylist. Any hit stops the publish.
+3. Make one commit whose tree is the export and whose parent is the public
+   branch's tip, authored by st.publishIdentity. The public repository gets
+   snapshots; the internal history (commits, messages, authors, files deleted
+   later) never leaves this machine.
+4. Run the deterministic gate on that exact commit, then push it.
+
+The pre-push hook (scripts/check) refuses any push to a public remote of a
+commit this script did not make, so `git push public main` cannot leak the
+internal history.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from types import ModuleType
+from typing import NamedTuple
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Built-in rules: generic, so they are safe to publish. Written so that this
+# file does not match itself (for example `\s+` where the text has a space).
+RULES: list[tuple[str, str]] = [
+    ("private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    ("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("GitHub token", r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"),
+    ("Slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    ("API key", r"\b(?:sk-[A-Za-z0-9]{32,}|AIza[0-9A-Za-z_-]{35})"),
+    ("home directory", r"(?:/Users/|/home/|[A-Z]:\\Users\\)(?!(?:you|user|me|runner|USER|name)\b)"
+                       r"[A-Za-z][\w.-]*"),
+    ("confidentiality marker", r"\b(?:do\s+not\s+publish|internal\s+(?:use\s+)?only|"
+                               r"confidentia[l]|proprietar[y]|trade\s+secrets?)\b"),
+]
+EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b")
+# Addresses that identify nobody: documentation domains, noreply, and ssh remotes.
+PUBLIC_EMAIL_DOMAINS = re.compile(
+    r"(?:^|\.)(?:example\.(?:com|org|net)|invalid|test|localhost|"
+    r"users\.noreply\.github\.com|noreply\.github\.com)$", re.I)
+SSH_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
+
+
+class Hit(NamedTuple):
+    path: str
+    line: int  # 0: the path itself
+    rule: str
+    text: str
+
+
+def load_check() -> ModuleType:
+    loader = importlib.machinery.SourceFileLoader("st_check", str(ROOT / "scripts" / "check"))
+    spec = importlib.util.spec_from_loader("st_check", loader)
+    if spec is None:
+        sys.exit(f"publish: cannot load {ROOT / 'scripts' / 'check'}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+check = load_check()
+git = check.git
+
+
+def say(message: str) -> None:
+    print(f"publish: {message}", flush=True)
+
+
+def fail(message: str) -> None:
+    sys.exit(f"publish: {message}")
+
+
+# ---- configuration -----------------------------------------------------------
+
+def config(key: str, default: str | None = None) -> str | None:
+    try:
+        return git(["config", "--get", key]) or default
+    except subprocess.CalledProcessError:
+        return default
+
+
+def common_dir() -> Path:
+    return Path(git(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+
+
+def denylist_paths() -> list[Path]:
+    user = Path(os.environ.get("ST_CONFIG_DIR") or Path.home() / ".config" / "surgical-team")
+    return [common_dir() / "info" / "publish-denylist", user / "publish-denylist"]
+
+
+def load_denylist() -> list[tuple[str, re.Pattern[str]]]:
+    rules: list[tuple[str, re.Pattern[str]]] = []
+    for path in denylist_paths():
+        if not path.is_file():
+            continue
+        for number, raw in enumerate(path.read_text().splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                rules.append((f"denylist {path.name}:{number}", re.compile(line, re.I)))
+            except re.error as error:
+                fail(f"{path}:{number}: invalid regex ({error})")
+    return rules
+
+
+Rules = list[tuple[str, "re.Pattern[str]"]]
+
+
+def compiled_rules(denylist: Rules) -> Rules:
+    return [(name, re.compile(pattern)) for name, pattern in RULES] + denylist
+
+
+# ---- scanning ----------------------------------------------------------------
+
+def scan_text(path: str, text: str, rules: list[tuple[str, re.Pattern[str]]]) -> list[Hit]:
+    hits = [Hit(path, 0, name, path) for name, rule in rules if rule.search(path)]
+    for number, line in enumerate(text.splitlines(), 1):
+        for name, rule in rules:
+            if rule.search(line):
+                hits.append(Hit(path, number, name, line.strip()))
+        for match in EMAIL.finditer(line):
+            domain = match.group(1)
+            local = match.group(0).split("@", 1)[0]
+            if PUBLIC_EMAIL_DOMAINS.search(domain) or (local == "git" and domain in SSH_HOSTS):
+                continue
+            hits.append(Hit(path, number, "email address", line.strip()))
+    return hits
+
+
+def scan_tree(export: Path, rules: list[tuple[str, re.Pattern[str]]]) -> list[Hit]:
+    hits: list[Hit] = []
+    for file in sorted(p for p in export.rglob("*") if p.is_file() or p.is_symlink()):
+        rel = file.relative_to(export).as_posix()
+        if file.is_symlink():
+            hits += scan_text(rel, os.readlink(file), rules)
+            continue
+        data = file.read_bytes()
+        if b"\0" in data[:8192]:
+            hits += scan_text(rel, "", rules)  # binary: the name only
+            continue
+        hits += scan_text(rel, data.decode("utf-8", "replace"), rules)
+    return hits
+
+
+def report(hits: list[Hit]) -> None:
+    for hit in hits[:50]:
+        where = hit.path if hit.line == 0 else f"{hit.path}:{hit.line}"
+        print(f"  {where}: {hit.rule}: {hit.text[:120]}")
+    if len(hits) > 50:
+        print(f"  ... and {len(hits) - 50} more")
+
+
+# ---- building the public commit ----------------------------------------------
+
+def export(sha: str, into: Path) -> Path:
+    """HEAD as `git archive` ships it: export-ignore paths are left out."""
+    tar = into / "export.tar"
+    git(["archive", "--format=tar", "-o", str(tar), sha])
+    tree = into / "export"
+    tree.mkdir()
+    with tarfile.open(tar) as archive:
+        for member in archive.getmembers():  # git archive writes only plain relative paths
+            if member.name.startswith("/") or ".." in Path(member.name).parts:
+                fail(f"unexpected archive member {member.name}")
+        archive.extractall(tree)  # noqa: S202 - our own git archive, members checked above
+    tar.unlink()
+    return tree
+
+
+def public_tip(remote: str, branch: str) -> str | None:
+    """Fetch the public branch; its tip is the parent of the new snapshot."""
+    ref = f"refs/publish/{remote}/{branch}"
+    try:
+        git(["fetch", "-q", "--no-tags", remote, f"+refs/heads/{branch}:{ref}"])
+    except subprocess.CalledProcessError as error:
+        if "couldn't find remote ref" in (error.stderr or ""):
+            return None  # an empty repository: the first snapshot is a root commit
+        fail(f"cannot fetch {remote}/{branch}: {(error.stderr or '').strip()}")
+    return str(git(["rev-parse", ref]))
+
+
+def parse_identity(identity: str) -> tuple[str, str]:
+    match = re.fullmatch(r"\s*(.+?)\s*<([^<>\s]+@[^<>\s]+)>\s*", identity)
+    if not match:
+        sys.exit("publish: st.publishIdentity must look like 'Name <address>'")
+    return match.group(1), match.group(2)
+
+
+def snapshot(tree_dir: Path, parent: str | None, message: str, identity: str,
+             scratch: Path) -> str | None:
+    """A commit of `tree_dir` on `parent`, or None when the tree is unchanged."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_DIR=str(common_dir()), GIT_WORK_TREE=str(tree_dir),
+               GIT_INDEX_FILE=str(scratch / "index"))
+    def run(*args: str, stdin: str | None = None) -> str:
+        return subprocess.run(["git", *args], env=env, check=True, capture_output=True,
+                              text=True, input=stdin).stdout.strip()
+    run("add", "-A", "-f", ".")
+    tree = run("write-tree")
+    if parent and run("rev-parse", f"{parent}^{{tree}}") == tree:
+        return None
+    name, email = parse_identity(identity)
+    env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    args = ["commit-tree", tree] + (["-p", parent] if parent else [])
+    return run(*args, stdin=message.rstrip() + "\n")
+
+
+def record(sha: str, source: str) -> None:
+    """Mark `sha` as made here; the pre-push hook lets only these reach a public remote."""
+    path = common_dir() / "st-publish" / sha
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(source + "\n")
+
+
+def changed(parent: str | None, sha: str) -> list[str] | None:
+    if parent is None:
+        return None
+    return str(git(["diff", "--name-only", parent, sha])).splitlines()
+
+
+def default_message(sha: str) -> str:
+    model = ROOT / "src" / "surgical_team" / "model.py"
+    version = re.search(r'VERSION\s*=\s*"([^"]+)"', model.read_text()) if model.is_file() else None
+    return (f"Update to {version.group(1) if version else 'the latest version'}\n\n"
+            "A snapshot of the development repository; see CHANGELOG.md for what changed.\n")
+
+
+# ---- entry point ---------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--scan", action="store_true", help="scan the export only")
+    ap.add_argument("--dry-run", action="store_true", help="build the commit; do not push")
+    ap.add_argument("-m", "--message", help="the public commit message")
+    ap.add_argument("--remote", help="default: git config st.publicRemote")
+    ap.add_argument("--branch", help="default: git config st.publicBranch, else main")
+    args = ap.parse_args(argv)
+
+    sha = git(["rev-parse", "--verify", "HEAD^{commit}"])
+    denylist = load_denylist()
+    if not denylist:
+        fail("no private denylist at " + " or ".join(map(str, denylist_paths())) +
+             "; list the names that must never ship (one regex per line) first")
+    rules = compiled_rules(denylist)
+    message = args.message or default_message(sha)
+
+    with tempfile.TemporaryDirectory(prefix="st-publish-") as tmp:
+        scratch = Path(tmp)
+        tree_dir = export(sha, scratch)
+        hits = scan_tree(tree_dir, rules) + scan_text("<commit message>", message, rules)
+        files = sum(1 for p in tree_dir.rglob("*") if p.is_file())
+        if hits:
+            say(f"{len(hits)} finding(s) in {files} exported files; nothing was published:")
+            report(hits)
+            say("remove the content, mark the path export-ignore in .gitattributes, or "
+                "narrow the rule, then re-run")
+            return 1
+        say(f"scan clean: {files} files, {len(denylist)} denylist rules, {len(RULES) + 1} "
+            "built-in rules")
+        if args.scan:
+            return 0
+
+        if git(["status", "--porcelain"]):
+            fail("the working tree is not clean; commit first, so what ships is a commit")
+        remote = args.remote or config("st.publicRemote")
+        identity = config("st.publishIdentity")
+        if not remote or not identity:
+            sys.exit("publish: set git config st.publicRemote and st.publishIdentity first "
+                     "(see --help)")
+        if scan_text("st.publishIdentity", identity, rules):
+            fail("st.publishIdentity matches a scan rule; use a public address")
+        branch = args.branch or config("st.publicBranch", "main") or "main"
+
+        parent = public_tip(remote, branch)
+        public = snapshot(tree_dir, parent, message, identity, scratch)
+        if public is None:
+            say(f"{remote}/{branch} already has this tree; nothing to publish")
+            return 0
+        files_changed = changed(parent, public)
+        needs_scenarios = check.affects_agents(files_changed)
+        if not check.satisfied(sha, needs_scenarios):
+            hint = "scripts/check --commit HEAD" + (" --scenarios" if needs_scenarios else "")
+            fail(f"HEAD {sha[:12]} has not passed the gate"
+                 f"{' with live scenarios' if needs_scenarios else ''}; run: {hint}")
+        record(public, sha)
+        say(f"built {public[:12]} on {parent[:12] if parent else '(new history)'}: "
+            f"{len(files_changed) if files_changed is not None else 'all'} file(s) change")
+        if args.dry_run:
+            say(f"dry run: not pushed; inspect with `git show --stat {public[:12]}`")
+            return 0
+
+    # The gate on the exact published tree. The scenarios ran on the source
+    # commit, whose tree differs only by export-ignored paths.
+    gate_args = argparse.Namespace(full=False, linux=False, scenarios=False, runs=1)
+    if check.check(public, files_changed, gate_args):
+        say("the gate failed on the public tree; not pushed")
+        return 1
+    check.stamp(public, check.stamped(sha) or check.GATE)
+    say(f"pushing {public[:12]} to {remote} {branch}")
+    return subprocess.run(["git", "push", remote, f"{public}:refs/heads/{branch}"],
+                          cwd=ROOT, check=False).returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

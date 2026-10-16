@@ -1,0 +1,417 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/order.json",
+  "title": "Ledger order record (.surgical-team/orders/WO-*.json); state is unsigned and grants nothing",
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^WO-\\d{8}-\\d{3}$"
+    },
+    "spec": {
+      "$ref": "#/$defs/stored_spec"
+    },
+    "state": {
+      "enum": [
+        "drafted",
+        "approved",
+        "dispatched",
+        "reported",
+        "deferred",
+        "accepted",
+        "rejected",
+        "cancelled"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+          },
+          "from": {
+            "enum": [
+              "drafted",
+              "approved",
+              "dispatched",
+              "reported",
+              "deferred",
+              "accepted",
+              "rejected",
+              "cancelled"
+            ]
+          },
+          "to": {
+            "enum": [
+              "drafted",
+              "approved",
+              "dispatched",
+              "reported",
+              "deferred",
+              "accepted",
+              "rejected",
+              "cancelled"
+            ]
+          },
+          "by": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "from",
+          "to",
+          "by",
+          "note"
+        ]
+      }
+    },
+    "approval": {
+      "allOf": [
+        {
+          "$ref": "signed.json"
+        },
+        {
+          "properties": {
+            "payload": {
+              "properties": {
+                "kind": {
+                  "const": "approve"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "cancellation": {
+      "allOf": [
+        {
+          "$ref": "signed.json"
+        },
+        {
+          "properties": {
+            "payload": {
+              "properties": {
+                "kind": {
+                  "const": "cancel"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "dispatch": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "authority_source": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "not_after": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "attempt",
+        "authority_source",
+        "workspace",
+        "branch",
+        "not_after"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "id",
+    "spec",
+    "state",
+    "revision",
+    "attempt",
+    "created",
+    "history"
+  ],
+  "$defs": {
+    "stored_spec": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+        },
+        "authority": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2"
+          ]
+        },
+        "push": {
+          "type": "boolean"
+        },
+        "intent": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "in": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            },
+            "out": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "in",
+            "out"
+          ]
+        },
+        "inputs": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "decisions": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^DEC-\\d{3,}$"
+              }
+            },
+            "orders": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^WO-\\d{8}-\\d{3}$"
+              }
+            },
+            "review": {
+              "type": "object",
+              "properties": {
+                "base": {
+                  "type": "string",
+                  "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+                },
+                "head": {
+                  "type": "string",
+                  "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "base",
+                "head"
+              ]
+            },
+            "sources": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/source"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "check": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "text"
+            ]
+          }
+        },
+        "budget": {
+          "type": "object",
+          "properties": {
+            "minutes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "minutes"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^WO-\\d{8}-\\d{3}$"
+          }
+        },
+        "blind": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "standing": {
+          "type": "string",
+          "pattern": "^DEC-\\d{3,}$"
+        },
+        "base": {
+          "type": "string"
+        },
+        "check_timeout": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "role",
+        "intent",
+        "scope",
+        "acceptance",
+        "budget",
+        "authority",
+        "depends_on",
+        "paths"
+      ]
+    },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "tool": {
+              "const": "use_aws"
+            },
+            "service": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]+$"
+            },
+            "operations": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            },
+            "region": {
+              "type": "string"
+            },
+            "profile": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "service",
+            "operations"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "tool": {
+              "type": "string",
+              "pattern": "^@?[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)?$",
+              "not": {
+                "const": "use_aws"
+              }
+            },
+            "readonly": {
+              "const": true
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "readonly"
+          ]
+        }
+      ]
+    }
+  }
+}

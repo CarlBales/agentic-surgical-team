@@ -1,0 +1,32 @@
+[tool.mypy]
+strict = true
+# Runtime floor is 3.9 (ruff target-version below enforces its syntax); mypy
+# itself requires >=3.10 to run, so it type-checks against 3.10.
+python_version = "3.10"
+files = ["src/surgical_team"]
+warn_unreachable = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "S", "UP", "SIM", "PL"]
+ignore = [
+    # The guard intentionally uses explicit, auditable branches; do not reshape
+    # security policy merely to satisfy generic complexity thresholds.
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    # Numeric authority thresholds and the fixed daily ID limit are protocol values.
+    "PLR2004",
+    # st check deliberately executes surgeon-signed acceptance commands through a shell.
+    "S602",
+    # git/ssh-keygen executables and arguments are intentionally controlled by st policy.
+    "S603",
+    "S607",
+    # Keep staged guard conditions explicit rather than merging security-policy branches.
+    "SIM102",
+    # Preserve the CLI's existing implicit exception chaining for invalid JSON input.
+    "B904",
+]

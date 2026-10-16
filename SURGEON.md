@@ -8,12 +8,16 @@ all of them.
 
 The team exists to keep you working on the parts that require judgment.
 
+New to the team? [GETTING-STARTED.md](GETTING-STARTED.md) walks through a first
+session on an existing project and on a new one.
+
 ## Setup, once
 
 ```bash
 export PATH="/path/to/the-surgical-team/bin:$PATH"
 st setup --key ~/.ssh/id_ed25519 --identity you@example.com  # your signing key
-st install                                                   # writes ~/.kiro/agents/st-*.json
+st install                                                   # Kiro: writes ~/.kiro/agents/st-*.json
+st install --host cursor                                     # Cursor Agent CLI only: subagents, /st, guard hook
 ```
 
 Then, in each project:
@@ -21,8 +25,21 @@ Then, in each project:
 ```bash
 st init --default-standing   # creates .surgical-team/; L0 work needs no approval
 git add .surgical-team && git commit -m "Add surgical team ledger"
-kiro-cli chat --agent st-copilot
+kiro-cli chat --agent st-copilot   # Kiro
+agent "/st"                        # Cursor Agent CLI only
 ```
+
+The team is there only when you call it. On Kiro, that is the `st-copilot`
+agent; on Cursor, it is an Agent CLI chat started with `agent "/st"`. Cursor
+team sessions are supported and verified on the Cursor Agent CLI only. Do not
+run them in the Cursor IDE until it is verified: this project's IDE session did
+not route tool calls through user-level hooks, so the guard may be absent (see
+the README's [Limits](README.md#limits-and-open-questions)). The guard runs on
+every tool call in the supported session. Every other Agent CLI chat, even in a
+team project, is ordinary Cursor for your own hands-on work; it just cannot
+launch the team's agents. **Never run a Cursor cloud/background agent on a
+team project:** it runs without the guard (see
+[authority levels](skills/surgical-team-protocol/references/authority-levels.md#what-the-guard-cannot-catch)).
 
 Your signing key is the team's trust root. Every approval, verdict,
 decision, and standing order is signed with it, and agents cannot produce a
@@ -42,17 +59,19 @@ used by that code.
 
 ## What only you do
 
-These commands sign with your key. Run them in your own terminal; the guard
-blocks them for every agent.
+These commands sign with your key or remove the team's state. Run them in
+your own terminal; the guard blocks them for every agent.
 
 | You | Command |
 |---|---|
 | **Approve** an order, choosing how far it may reach and for how long | `st approve WO-… [--level L0/L1/L2] [--push] [--for MINUTES]` |
 | **Accept, reject, or defer** reported work, several at once | `st accept WO-a WO-b`, `st reject WO-c -m "why"`, `st defer …` |
-| **Decide**, so nobody has to re-ask | `st decide --title … --decision … [--supersedes DEC-…]` |
+| **Decide**, so nobody has to re-ask; every briefing carries it from then on | `st decide --title … --decision … [--supersedes DEC-…] [--dissent "…"]` |
 | **Grant** standing authority for routine work | `st grant --role tester --max L1 --budget 30 --scope "…" --expires …` |
 | **Revoke** a decision or standing order | `st revoke DEC-…` |
 | **Cancel** an order | `st cancel WO-…` |
+| **Clean up** finished orders' worktrees and branches | `st prune [--dry-run] [--force]` |
+| **Remove** the team from your machine (ledgers stay) | `st uninstall [--host kiro\|cursor]` |
 
 And beyond the commands:
 

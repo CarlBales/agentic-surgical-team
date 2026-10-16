@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/decision-record.json",
+  "title": "Ledger decision record (.surgical-team/decisions/DEC-*.json): decisions, standing orders, revocations",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^DEC-\\d{3,}$"
+    },
+    "format": {
+      "const": 1
+    },
+    "signed": {
+      "allOf": [
+        {
+          "$ref": "signed.json"
+        },
+        {
+          "properties": {
+            "payload": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "decision",
+                    "standing",
+                    "revoke"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "format",
+    "signed"
+  ]
+}

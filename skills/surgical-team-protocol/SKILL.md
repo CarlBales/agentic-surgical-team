@@ -1,10 +1,10 @@
 ---
 name: surgical-team-protocol
-description: Shared operating rules for the surgical team - a human surgeon (chief programmer) supported by guarded agent roles, coordinated through the `st` control plane. Defines authority levels, work orders and reports, escalation and refusal, and how the ledger is read. Load only when running as a surgical team agent (st-copilot, st-editor, st-toolsmith, st-tester, st-language-lawyer-*) or when the user explicitly mentions the surgical team, work orders, or scrubbing in.
+description: Shared operating rules for the surgical team - a human surgeon (chief programmer) supported by guarded agent roles, coordinated through the `st` control plane. Defines authority levels, work orders and reports, escalation and refusal, and how the ledger is read. Load only when running as a surgical team agent (any st-<role> agent installed by `st install`, such as st-copilot, st-tester, st-reviewer, st-language-lawyer-*) or when the user explicitly mentions the surgical team, work orders, or scrubbing in.
 license: MIT
 metadata:
   author: the-surgical-team
-  version: "0.3"
+  version: "0.4"
   surgical-team-role: protocol
 ---
 
@@ -20,13 +20,14 @@ your good behavior for, the machinery enforces:
 - **`st`** is the control plane. It assigns IDs, validates orders, runs the
   state machine, creates workspaces, runs acceptance checks, and renders
   the status board. Records are JSON; you never write them by hand.
-- **The guard** (`st guard`, a preToolUse hook on every team agent) checks
-  every tool call against the order you hold. A block means that action is
-  outside your order. Never try to achieve the same effect another way (a
-  different tool, a script, an indirection); that is a protocol violation
-  even if it works. Do carry on with the parts of the order that are within
-  it, and put the block, verbatim, in your report. If the block stops the
-  order itself, report `BLOCKED`.
+- **The guard** (`st guard`, installed per agent on Kiro and as a global,
+  role-bound hook for supported Cursor Agent CLI team sessions) checks every
+  tool call against the order you hold.
+  A block means that action is outside your order. Never try to achieve the
+  same effect another way (a different tool, a script, an indirection); that
+  is a protocol violation even if it works. Do carry on with the parts of the
+  order that are within it, and put the block, verbatim, in your report. If the
+  block stops the order itself, report `BLOCKED`.
 - **Signatures and leases.** Approvals, verdicts, decisions, and standing
   orders are signed with the surgeon's SSH key, and approvals expire.
   Agents cannot produce signatures. Live authority is a lease that
@@ -71,12 +72,12 @@ prints the briefing the specialist receives.
 | Field | Meaning |
 |---|---|
 | `title` | short name; becomes the branch slug |
-| `role` | `copilot`, `editor`, `toolsmith`, `tester`, `language-lawyer-<lang>` |
+| `role` | any team role: a skill in the team's `skills/` with `metadata.surgical-team-role` (see Roles) |
 | `authority` | `L0`, `L1`, `L2` (default `L0`) |
 | `push` | `true` only at L2, and only if the surgeon approves it |
 | `intent` | why this matters, so the agent can make small calls alone |
 | `scope.in`, `scope.out` | what is in, and the adjacent things to leave alone |
-| `inputs` | files, prior orders, `decisions` (each must be an active DEC) |
+| `inputs` | files, prior orders, `decisions` (each must be an active DEC), `review` (`{base, head}`; pinned to commit SHAs at draft), `sources` (read-only external tools; see [authority-levels.md](references/authority-levels.md#read-only-sources)) |
 | `acceptance` | list of `{text, check?}`; `check` is a shell command, exit 0 means met |
 | `budget.minutes` | scoping estimate; see Budgets |
 | `paths` | files or dirs the order touches; overlapping in-flight orders are refused |
@@ -206,7 +207,18 @@ briefing.
 | toolsmith | `st-toolsmith` | Dev environment, scripts, CI, tooling for the team | L1, L2 |
 | tester | `st-tester` | Adversarial tests from the spec; scaffolding and data | L1, L2 |
 | language-lawyer-`<lang>` | `st-language-lawyer-<lang>` | Language-level correctness, idiom, API judgment | L0, L1 for patches |
+| platform-lawyer-`<platform>` | `st-platform-lawyer-<platform>` | What the runtime, OS, or SDK requires and breaks | L0, L1 for patches |
+| reviewer, `<lens>`-reviewer | `st-reviewer`, `st-security-reviewer`, … | Independent review of a change from a clean context | L0 |
+| analyst (`archaeologist`, `incident-analyst`) | `st-<name>` | What the evidence shows about a system, graded by strength | L0, L1 to write the draft |
+| archivist | `st-archivist` | Keeps a structured knowledge corpus consistent | L1, L2 for vault paths |
 
 v0.1's administrator and program clerk are gone: their work was
-deterministic, so `st` does it. The language lawyer is a slot any skill
-satisfying the [contract](references/language-lawyer-contract.md) can fill.
+deterministic, so `st` does it. Language lawyers, platform lawyers,
+reviewers, and analysts are **consultants**: slots any skill satisfying the
+[consultant contract](references/consultant-contract.md) can fill.
+
+Roles are not a fixed list. A role is any skill in the team's `skills/`
+directory whose frontmatter declares `metadata.surgical-team-role`; `st
+draft` refuses any other role name, and `st install` writes one guarded agent
+per role. The team's `skills/` directory is guard-protected, so an agent
+cannot create a role.

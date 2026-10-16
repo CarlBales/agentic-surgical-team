@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/the-surgical-team/st/schema/signed.json",
+  "title": "A surgeon-signed record: payload signed with ssh-keygen -Y sign (namespace surgical-team) over its canonical JSON",
+  "type": "object",
+  "properties": {
+    "signer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^-----BEGIN SSH SIGNATURE-----"
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/approve"
+        },
+        {
+          "$ref": "#/$defs/verdict"
+        },
+        {
+          "$ref": "#/$defs/cancel"
+        },
+        {
+          "$ref": "#/$defs/decision"
+        },
+        {
+          "$ref": "#/$defs/standing"
+        },
+        {
+          "$ref": "#/$defs/revoke"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "signer",
+    "sig",
+    "payload"
+  ],
+  "$defs": {
+    "approve": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "approve"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "order": {
+          "type": "string",
+          "pattern": "^WO-\\d{8}-\\d{3}$"
+        },
+        "spec_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "authority": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2"
+          ]
+        },
+        "push": {
+          "type": "boolean"
+        },
+        "not_after": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "order",
+        "spec_sha",
+        "authority",
+        "push"
+      ]
+    },
+    "verdict": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "verdict"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "order": {
+          "type": "string",
+          "pattern": "^WO-\\d{8}-\\d{3}$"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "verdict": {
+          "enum": [
+            "accepted",
+            "rejected",
+            "deferred"
+          ]
+        },
+        "note": {
+          "type": "string"
+        },
+        "report_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "order",
+        "attempt",
+        "verdict"
+      ]
+    },
+    "cancel": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "cancel"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "order": {
+          "type": "string",
+          "pattern": "^WO-\\d{8}-\\d{3}$"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "order"
+      ]
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "decision"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^DEC-\\d{3,}$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        },
+        "context": {
+          "type": "string"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "consequences": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dissent": {
+          "description": "Objections raised and overruled, signed with the decision",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "scope": {
+          "type": "string"
+        },
+        "supersedes": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^DEC-\\d{3,}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expires": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "id",
+        "title",
+        "decision"
+      ]
+    },
+    "standing": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "standing"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^DEC-\\d{3,}$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+            },
+            {
+              "const": "*"
+            }
+          ]
+        },
+        "max_authority": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2"
+          ]
+        },
+        "budget_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": "string"
+        },
+        "expires": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supersedes": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^DEC-\\d{3,}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "id",
+        "role",
+        "max_authority",
+        "scope"
+      ]
+    },
+    "revoke": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "revoke"
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^DEC-\\d{3,}$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^DEC-\\d{3,}$"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "at",
+        "id",
+        "target"
+      ]
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "about": "A git repository with no ledger: the copilot cannot dispatch anything.",
+  "fixture": {
+    "no_ledger": true
+  },
+  "cases": [
+    {
+      "name": "mutant: subagent without a ledger",
+      "role": "copilot",
+      "tool": "subagent",
+      "input": {
+        "task": "x",
+        "stages": [
+          {
+            "name": "a",
+            "role": "st-tester",
+            "prompt_template": "WO-20260101-001"
+          }
+        ]
+      },
+      "cwd": "repo",
+      "expect": "block",
+      "reason": "no ledger"
+    }
+  ]
+}

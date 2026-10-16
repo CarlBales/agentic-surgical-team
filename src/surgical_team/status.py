@@ -1,0 +1,131 @@
+"""The status board (st status, STATUS.md)."""
+from __future__ import annotations
+
+import argparse
+
+from .authority import decision_status, effective_authority, integrity_problems, live_orders
+from .ledger import Ledger
+from .model import STALE_FACTOR, TERMINAL, iso, now, parse_iso
+
+
+def status_lines(ledger: Ledger) -> list[str]:
+    current_time = now()
+    orders = ledger.orders()
+    live_ids = {order["id"] for order, *_ in live_orders(ledger)}
+    awaiting: list[str] = []
+    inflight: list[str] = []
+    blocked: list[str] = []
+    ready: list[str] = []
+    for order in orders:
+        spec, state = order["spec"], order["state"]
+        tag = f"{order['id']}  {spec['role']}  {spec['authority']}  {spec['title']}"
+        if state == "drafted":
+            level, _, source = effective_authority(ledger, order)
+            if level is not None:
+                ready.append(f"{tag}  (covered by {source})")
+            else:
+                awaiting.append(f"approve: {tag}")
+        elif state == "approved":
+            ready.append(tag)
+        elif state == "dispatched":
+            started = parse_iso(order["dispatch"]["at"])
+            minutes = (current_time - started).total_seconds() / 60
+            budget = spec["budget"]["minutes"]
+            flag = "" if order["id"] in live_ids else "  NO LIVE LEASE HERE (no authority)"
+            if minutes > budget * STALE_FACTOR:
+                flag += "  STALE: no report; reclaim or chase"
+            elif minutes > budget:
+                flag += "  OVER BUDGET"
+            inflight.append(f"{tag}  {minutes:.0f}m/{budget}m{flag}")
+        elif state in ("reported", "deferred"):
+            report_record = (
+                ledger.attempt_record("reports", order["id"], order["attempt"]) or {}
+            )
+            report_status = (report_record.get("report") or {}).get("status", "?")
+            checks = ledger.attempt_record("checks", order["id"], order["attempt"])
+            contradiction = ""
+            if checks:
+                last = checks["runs"][-1]["results"]
+                ran = [result for result in last if result["ok"] is not None]
+                passed = sum(result["ok"] for result in ran)
+                executable = sum("check" in criterion for criterion in spec["acceptance"])
+                check_status = (
+                    f"checks {passed}/{executable} pass"
+                    if executable
+                    else "no executable checks"
+                )
+                # The report is the agent's account; the checks are independent.
+                if report_status == "DONE" and passed < len(ran):
+                    contradiction = "  CONTRADICTS: reported DONE, but checks fail"
+                elif (
+                    report_status in ("BLOCKED", "DECLINED")
+                    # Passing checks contradict a blocker only when the harness
+                    # independently covered every acceptance criterion.
+                    and executable == len(spec["acceptance"])
+                    and len(ran) == executable
+                    and passed == executable
+                ):
+                    contradiction = (
+                        f"  CONTRADICTS: reported {report_status}, but every check passes"
+                    )
+            elif any("check" in criterion for criterion in spec["acceptance"]):
+                check_status = "checks NOT RUN"
+            else:
+                check_status = "no executable checks"
+            line = f"verdict: {tag}  {report_status}, {check_status}{contradiction}" + (
+                "  (deferred)" if state == "deferred" else ""
+            )
+            (blocked if report_status in ("BLOCKED", "DECLINED") else awaiting).append(line)
+    standing: list[str] = []
+    recent: list[str] = []
+    for decision in ledger.decisions():
+        status, record = decision_status(ledger, decision["id"])
+        payload = record["signed"]["payload"] if record and record.get("signed") else {}
+        if payload.get("kind") == "standing" and status == "active":
+            standing.append(
+                f"{decision['id']}: {payload['role']} up to {payload['max_authority']}, "
+                f"{payload.get('budget_minutes', '-')}m, until "
+                f"{payload.get('expires', 'revoked')}: {payload.get('scope', '')}"
+            )
+        elif payload.get("kind") == "decision" and status == "active":
+            dissent = len(payload.get("dissent") or [])
+            recent.append(f"{decision['id']} {payload.get('title', '')}"
+                          + (f"  (decided over {dissent} objection(s))" if dissent else ""))
+    workspaces = [
+        f"{order['id']}  {order['dispatch']['workspace']}  ({order['dispatch']['branch']})"
+        for order in orders
+        if order.get("dispatch", {}).get("workspace") and order["state"] not in TERMINAL
+    ]
+    problems = integrity_problems(ledger)
+    output = [
+        f"# Status — {iso(current_time)}",
+        "",
+        "Generated by `st`. Do not edit; it is rebuilt on every ledger change.",
+        "",
+    ]
+
+    def section(title: str, items: list[str], empty: str = "none") -> None:
+        output.extend([f"## {title}", *([f"- {item}" for item in items] or [f"- {empty}"]), ""])
+
+    if problems:
+        section("INTEGRITY PROBLEMS (run `st verify`)", problems)
+    section("Awaiting the surgeon", awaiting)
+    section("Blocked or declined", blocked)
+    section("In flight", inflight)
+    section("Ready to dispatch", ready)
+    section("Standing orders in force", standing)
+    section("Recent decisions", recent[-5:])
+    section("Live workspaces", workspaces)
+    return output
+
+
+def render_status(ledger: Ledger) -> None:
+    (ledger.dir / "STATUS.md").write_text("\n".join(status_lines(ledger)))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    ledger = Ledger.at()
+    ledger.require()
+    lines = status_lines(ledger)
+    (ledger.dir / "STATUS.md").write_text("\n".join(lines))
+    print("\n".join(lines))

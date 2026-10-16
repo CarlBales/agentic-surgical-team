@@ -10,7 +10,10 @@ The language lawyer was consulted rather than assigned. The surgeon knew how
 to solve the problem; the language lawyer knew the neat and efficient way to
 say it in the language at hand.
 
-This contract defines the slot so any language can fill it. A skill named
+This contract defines the slot so any language can fill it. It is the
+language-lawyer supplement to the
+[consultant contract](consultant-contract.md), which holds the requirements
+every consulted specialist shares. A skill named
 `language-lawyer-<lang>` that satisfies everything below is a valid
 occupant. Start from
 [assets/language-lawyer-template.md](../assets/language-lawyer-template.md).
